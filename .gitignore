@@ -21,7 +21,3 @@ Package.resolved
 
 ## macOS
 .DS_Store
-
-## XcodeGen
-# We generate the .xcodeproj from project.yml — don't commit it.
-Transcripty.xcodeproj/
