@@ -1,0 +1,30 @@
+## Xcode
+*.xcodeproj/*
+!*.xcodeproj/project.xcworkspace/
+*.xcworkspace/xcuserdata/
+xcuserdata/
+DerivedData/
+build/
+.build/
+*.xcuserstate
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+## Build script
+make-release.sh
+
+## Swift Package Manager
+Packages/
+Package.resolved
+.swiftpm/
+
+## macOS
+.DS_Store
+
+## XcodeGen
+# We generate the .xcodeproj from project.yml — don't commit it.
+Transcripty.xcodeproj/
