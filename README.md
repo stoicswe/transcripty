@@ -1,10 +1,6 @@
 # Transcripty
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/transcripty_screenshot.png">
-  <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/transcripty_screenshot.png">
-  <img alt="Transcripty editor" src="docs/transcripty_screenshot.png">
-</picture>
+![Transcripty-App](docs/transcripty_screenshot.png)
 
 Offline, on-device audio transcription for macOS with multi-speaker
 diarization, word-level playback sync, and a transcript editor that lets you
