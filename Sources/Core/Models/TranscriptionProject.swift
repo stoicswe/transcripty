@@ -116,6 +116,11 @@ final class SpeakerSegment {
     /// label transfer when the user retranscribes — every segment they've
     /// labelled becomes a piece of training data.
     var embedding: [Float] = []
+    /// True when the user has manually edited the text of this segment but
+    /// hasn't asked for a fresh forced-alignment pass yet. Until that runs,
+    /// any inserted/changed words carry interpolated timings that the editor
+    /// surfaces via a "Recompute Timings" affordance.
+    var wasEdited: Bool = false
     var project: TranscriptionProject?
 
     init(startSeconds: Double,

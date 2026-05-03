@@ -472,6 +472,26 @@ final class TranscriptionService {
             )
             recreated.project = project
             modelContext.insert(recreated)
+
+        case let .textChanged(segmentID, previousText, previousWords, previousWasEdited):
+            guard let segment = project.segments.first(where: { $0.id == segmentID }) else { return }
+            segment.text = previousText
+            segment.words = previousWords
+            segment.wasEdited = previousWasEdited
+
+        case let .wordsMoved(sourceID, targetID, _,
+                              srcText, srcWords, srcStart, srcEnd,
+                              tgtText, tgtWords, tgtStart, tgtEnd, _):
+            guard let source = project.segments.first(where: { $0.id == sourceID }),
+                  let target = project.segments.first(where: { $0.id == targetID }) else { return }
+            source.text = srcText
+            source.words = srcWords
+            source.startSeconds = srcStart
+            source.endSeconds = srcEnd
+            target.text = tgtText
+            target.words = tgtWords
+            target.startSeconds = tgtStart
+            target.endSeconds = tgtEnd
         }
     }
 
@@ -808,6 +828,514 @@ final class TranscriptionService {
         var dot: Float = 0
         for i in 0..<a.count { dot += a[i] * b[i] }
         return dot
+    }
+
+    // MARK: - Inline text editing
+
+    /// Replaces a segment's transcript text with the user's edit and rebuilds
+    /// its word-level timings via LCS-based reconciliation. Words that the
+    /// user kept unchanged keep their original (model-provided) timings;
+    /// inserted/changed words get evenly interpolated estimates between the
+    /// nearest matched neighbors. The segment is flagged `wasEdited` so the
+    /// editor surfaces the "Recompute Timings" affordance until the user
+    /// asks for a forced-alignment pass.
+    /// Pure-text substitution paths (find/replace, censor, replace-with) are
+    /// passed `markEdited: false` so the change doesn't flip the segment's
+    /// `wasEdited` flag — recomputing timings can't help when the audio
+    /// underneath still says the *original* word, only when the user typed
+    /// something the recognizer might align differently. The default `true`
+    /// preserves the inline-editor and re-import flows.
+    @discardableResult
+    func applyTextEdit(
+        to segment: SpeakerSegment,
+        newText: String,
+        in project: TranscriptionProject,
+        markEdited: Bool = true
+    ) -> Bool {
+        let trimmed = newText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed != segment.text else { return false }
+        let newTokens = TranscriptEditing.tokenize(trimmed)
+
+        // Snapshot pre-edit state so the revision history can undo this
+        // change verbatim — not just the text, but the (possibly model-
+        // produced) word timings + the wasEdited flag, since the act of
+        // editing flips that flag and undoing should flip it back.
+        let previousText = segment.text
+        let previousWords = segment.words
+        let previousWasEdited = segment.wasEdited
+
+        if newTokens.isEmpty {
+            // The user emptied the segment. Keep the row as a placeholder
+            // rather than deleting it so they can recover by typing again;
+            // surrounding playback timings stay intact.
+            segment.words = []
+            segment.text = ""
+        } else {
+            let reconciled = TranscriptEditing.reconcileWords(
+                oldWords: segment.words,
+                newTokens: newTokens,
+                segmentStart: segment.startSeconds,
+                segmentEnd: segment.endSeconds
+            )
+            segment.text = trimmed
+            segment.words = reconciled
+        }
+        if markEdited {
+            segment.wasEdited = true
+        }
+
+        recordEdit(
+            .textChanged(
+                segmentID: segment.id,
+                previousText: previousText,
+                previousWords: previousWords,
+                previousWasEdited: previousWasEdited
+            ),
+            summary: editSummary(previous: previousText, current: trimmed),
+            in: project,
+            contextSegmentID: segment.id
+        )
+        try? modelContext.save()
+        return true
+    }
+
+    // MARK: - Transcript text re-import
+
+    struct TranscriptImportSummary: Sendable {
+        let updatedSegmentCount: Int
+        let unchangedSegmentCount: Int
+        let importedSegmentCount: Int
+        let projectSegmentCount: Int
+
+        var skippedSegmentCount: Int {
+            max(0, projectSegmentCount - importedSegmentCount)
+        }
+
+        var extraSegmentCount: Int {
+            max(0, importedSegmentCount - projectSegmentCount)
+        }
+    }
+
+    /// Reads a plain-text transcript exported from this app and applies the
+    /// per-segment text differences as inline edits — each one a discrete
+    /// revision-history entry, so the reimport can be undone segment-by-
+    /// segment if needed. Segments are matched by chronological order; the
+    /// shorter of the two sides bounds how many get compared, and the user
+    /// is told about any mismatch in the returned summary.
+    @discardableResult
+    func reimportTranscriptText(
+        from sourceURL: URL,
+        into project: TranscriptionProject
+    ) throws -> TranscriptImportSummary {
+        let accessed = sourceURL.startAccessingSecurityScopedResource()
+        defer { if accessed { sourceURL.stopAccessingSecurityScopedResource() } }
+
+        let raw = try String(contentsOf: sourceURL, encoding: .utf8)
+        let imported = TranscriptTextImporter.parse(raw)
+        let ordered = project.segments.sorted { $0.startSeconds < $1.startSeconds }
+        let comparable = min(imported.count, ordered.count)
+
+        var updated = 0
+        var unchanged = 0
+        for i in 0..<comparable {
+            let segment = ordered[i]
+            let newText = imported[i].text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let oldText = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if newText == oldText {
+                unchanged += 1
+                continue
+            }
+            let didApply = applyTextEdit(to: segment, newText: newText, in: project)
+            if didApply {
+                updated += 1
+            } else {
+                unchanged += 1
+            }
+        }
+
+        return TranscriptImportSummary(
+            updatedSegmentCount: updated,
+            unchangedSegmentCount: unchanged,
+            importedSegmentCount: imported.count,
+            projectSegmentCount: ordered.count
+        )
+    }
+
+    enum MergeDirection {
+        case previous
+        case next
+    }
+
+    /// Moves a contiguous run of words from `segment` into the chronologically-
+    /// adjacent segment in `direction`. The run must form a clean prefix
+    /// (`direction == .previous`) or suffix (`direction == .next`) of
+    /// `segment.words` — moving a slice from the middle would leave the
+    /// segment with disconnected text.
+    ///
+    /// On success the words land at the *end* of the previous segment or the
+    /// *start* of the next segment, both segments' text/start/end re-derive
+    /// from the new word lists, and the move is recorded as a single undo-
+    /// able edit in the revision history.
+    @discardableResult
+    func moveWords(
+        from segment: SpeakerSegment,
+        wordRange: Range<Int>,
+        direction: MergeDirection,
+        in project: TranscriptionProject
+    ) -> Bool {
+        guard !wordRange.isEmpty,
+              wordRange.lowerBound >= 0,
+              wordRange.upperBound <= segment.words.count else { return false }
+
+        let isPrefix = wordRange.lowerBound == 0
+        let isSuffix = wordRange.upperBound == segment.words.count
+        switch direction {
+        case .previous:
+            guard isPrefix else { return false }
+        case .next:
+            guard isSuffix else { return false }
+        }
+
+        // Find the chronological neighbor.
+        let ordered = project.segments.sorted { $0.startSeconds < $1.startSeconds }
+        guard let currentIdx = ordered.firstIndex(where: { $0.id == segment.id }) else { return false }
+        let neighborIndex: Int
+        switch direction {
+        case .previous: neighborIndex = currentIdx - 1
+        case .next: neighborIndex = currentIdx + 1
+        }
+        guard neighborIndex >= 0, neighborIndex < ordered.count else { return false }
+        let neighbor = ordered[neighborIndex]
+        let movedWords = Array(segment.words[wordRange])
+        guard !movedWords.isEmpty else { return false }
+
+        // Snapshot pre-state for undo.
+        let srcText = segment.text
+        let srcWords = segment.words
+        let srcStart = segment.startSeconds
+        let srcEnd = segment.endSeconds
+        let tgtText = neighbor.text
+        let tgtWords = neighbor.words
+        let tgtStart = neighbor.startSeconds
+        let tgtEnd = neighbor.endSeconds
+
+        // Apply the move.
+        switch direction {
+        case .previous:
+            neighbor.words = neighbor.words + movedWords
+            segment.words.removeSubrange(wordRange)
+            // Source's startSeconds shifts to the new first word's start.
+            // Target's endSeconds stretches to cover the appended words.
+            if let firstRemaining = segment.words.first {
+                segment.startSeconds = firstRemaining.start
+            }
+            if let lastMoved = movedWords.last {
+                neighbor.endSeconds = max(neighbor.endSeconds, lastMoved.end)
+            }
+        case .next:
+            neighbor.words = movedWords + neighbor.words
+            segment.words.removeSubrange(wordRange)
+            // Source's endSeconds shrinks to the new last word's end.
+            // Target's startSeconds extends backward to cover the prepended.
+            if let lastRemaining = segment.words.last {
+                segment.endSeconds = lastRemaining.end
+            }
+            if let firstMoved = movedWords.first {
+                neighbor.startSeconds = min(neighbor.startSeconds, firstMoved.start)
+            }
+        }
+
+        // Re-derive plain text from the new word lists.
+        segment.text = segment.words.map(\.text).joined(separator: " ")
+        neighbor.text = neighbor.words.map(\.text).joined(separator: " ")
+
+        recordEdit(
+            .wordsMoved(
+                sourceSegmentID: segment.id,
+                targetSegmentID: neighbor.id,
+                movedWords: movedWords,
+                sourcePreviousText: srcText,
+                sourcePreviousWords: srcWords,
+                sourcePreviousStartSeconds: srcStart,
+                sourcePreviousEndSeconds: srcEnd,
+                targetPreviousText: tgtText,
+                targetPreviousWords: tgtWords,
+                targetPreviousStartSeconds: tgtStart,
+                targetPreviousEndSeconds: tgtEnd,
+                movedToPrefix: direction == .next
+            ),
+            summary: moveSummary(
+                count: movedWords.count,
+                direction: direction,
+                neighbor: neighbor,
+                project: project
+            ),
+            in: project,
+            contextSegmentID: neighbor.id
+        )
+        try? modelContext.save()
+        return true
+    }
+
+    private func moveSummary(
+        count: Int,
+        direction: MergeDirection,
+        neighbor: SpeakerSegment,
+        project: TranscriptionProject
+    ) -> String {
+        let target = project.displayName(forSpeakerID: neighbor.speakerID)
+        let plural = count == 1 ? "word" : "words"
+        switch direction {
+        case .previous: return "Moved \(count) \(plural) to \(target) (previous)"
+        case .next:     return "Moved \(count) \(plural) to \(target) (next)"
+        }
+    }
+
+    /// One-line description for the revision-history list. Picks the first
+    /// few words of the new text — enough to recognize *which* segment was
+    /// edited at a glance.
+    private func editSummary(previous: String, current: String) -> String {
+        let trimmedCurrent = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedCurrent.isEmpty {
+            return "Cleared segment text"
+        }
+        let tokens = trimmedCurrent.split(whereSeparator: { $0.isWhitespace })
+        let preview = tokens.prefix(6).joined(separator: " ")
+        let suffix = tokens.count > 6 ? "…" : ""
+        return "Edited text — \"\(preview)\(suffix)\""
+    }
+
+    /// True when at least one segment carries the `wasEdited` flag — i.e.
+    /// the user has made manual text edits since the last forced-alignment
+    /// pass. The editor uses this to decide whether to show the recompute
+    /// popup.
+    func projectNeedsTimingRecompute(_ project: TranscriptionProject) -> Bool {
+        project.segments.contains(where: { $0.wasEdited })
+    }
+
+    /// Re-extracts each edited segment's audio range, re-runs the speech
+    /// recognizer on it, and rewrites the segment's word timings against
+    /// the freshly aligned output. The user's edited *text* is authoritative
+    /// — when the recognizer's transcript differs (because we re-typed it),
+    /// LCS picks the matched words and interpolates the rest.
+    @MainActor
+    func recomputeTimings(
+        for project: TranscriptionProject,
+        locale: Locale = .current,
+        onProgress: @escaping (Double) -> Void = { _ in }
+    ) async throws {
+        guard let audioURL = project.sourceAudioURL else {
+            throw TranscriptEditing.RecomputeError.sourceUnavailable
+        }
+        let editedSegments = project.segments
+            .filter { $0.wasEdited }
+            .sorted { $0.startSeconds < $1.startSeconds }
+        guard !editedSegments.isEmpty else { return }
+
+        let transcriber = AppleSpeechTranscriber()
+        let total = Double(editedSegments.count)
+
+        for (index, segment) in editedSegments.enumerated() {
+            onProgress(Double(index) / total)
+
+            // Pad each side a hair so the recognizer has a moment to settle —
+            // 100 ms of leading/trailing context noticeably reduces clipped
+            // edges, and the offset math below subtracts the lead back out.
+            let leadPad: TimeInterval = 0.1
+            let trailPad: TimeInterval = 0.1
+            let extractStart = max(0, segment.startSeconds - leadPad)
+            let extractEnd = segment.endSeconds + trailPad
+
+            let extracted: URL
+            do {
+                extracted = try await TranscriptEditing.extractAudioRange(
+                    from: audioURL,
+                    start: extractStart,
+                    end: extractEnd
+                )
+            } catch {
+                // Segment-level failure shouldn't abort the whole recompute.
+                continue
+            }
+            defer { try? FileManager.default.removeItem(at: extracted) }
+
+            let recognized: [TranscribedSegment]
+            do {
+                recognized = try await transcriber.transcribe(
+                    audioURL: extracted,
+                    locale: locale,
+                    onProgress: { _ in }
+                )
+            } catch {
+                continue
+            }
+            let recognizedWords = recognized.flatMap(\.words)
+
+            let aligned = align(
+                userTokens: segment.words.map(\.text),
+                userOldWords: segment.words,
+                recognizedWords: recognizedWords,
+                lead: extractStart,
+                segmentStart: segment.startSeconds,
+                segmentEnd: segment.endSeconds
+            )
+            segment.words = aligned
+            segment.wasEdited = false
+            try? modelContext.save()
+        }
+        onProgress(1.0)
+    }
+
+    /// Aligns the user's segment tokens against the recognizer's freshly-
+    /// produced word list. Strategy:
+    ///   1. LCS over lowercased text.
+    ///   2. Matched user tokens take the recognizer's timings (offset back
+    ///      into the project's timeline).
+    ///   3. Unmatched user tokens get interpolated between matched anchors,
+    ///      falling back to segment bounds at the edges.
+    private func align(
+        userTokens: [String],
+        userOldWords: [WordTiming],
+        recognizedWords: [WordTiming],
+        lead: TimeInterval,
+        segmentStart: TimeInterval,
+        segmentEnd: TimeInterval
+    ) -> [WordTiming] {
+        guard !userTokens.isEmpty else { return [] }
+        // Recognizer timings are relative to the extracted clip's t=0; shift
+        // them back into the project's absolute timeline so they line up
+        // with the editor's playback.
+        let absoluteRecognized = recognizedWords.map { word in
+            WordTiming(
+                start: lead + word.start,
+                end: lead + word.end,
+                text: word.text
+            )
+        }
+
+        let userLower = userTokens.map { $0.lowercased() }
+        let recogLower = absoluteRecognized.map { stripPunctuation($0.text.lowercased()) }
+        let userClean = userLower.map(stripPunctuation)
+
+        let matches = TranscriptEditing.lcsMatches(old: recogLower, new: userClean)
+        var slots: [WordTiming?] = Array(repeating: nil, count: userTokens.count)
+        for (recogIdx, userIdx) in matches {
+            let r = absoluteRecognized[recogIdx]
+            slots[userIdx] = WordTiming(start: r.start, end: r.end, text: userTokens[userIdx])
+        }
+
+        var i = 0
+        while i < slots.count {
+            if slots[i] != nil { i += 1; continue }
+            var j = i
+            while j < slots.count, slots[j] == nil { j += 1 }
+            let lead: TimeInterval = (i > 0) ? (slots[i - 1]?.end ?? segmentStart) : segmentStart
+            let trail: TimeInterval = (j < slots.count) ? (slots[j]?.start ?? segmentEnd) : segmentEnd
+            let span = max(0.05, trail - lead)
+            let runCount = j - i
+            let perWord = span / Double(runCount)
+            for k in 0..<runCount {
+                let s = lead + perWord * Double(k)
+                let e = lead + perWord * Double(k + 1)
+                slots[i + k] = WordTiming(start: s, end: e, text: userTokens[i + k])
+            }
+            i = j
+        }
+        return slots.compactMap { $0 }
+    }
+
+    private func stripPunctuation(_ s: String) -> String {
+        s.unicodeScalars.filter { !CharacterSet.punctuationCharacters.contains($0) }
+            .reduce(into: "") { $0.append(Character($1)) }
+    }
+
+    // MARK: - Project archive
+
+    /// Exports `project` to a single-file `.tscripty` archive (a flat ZIP of
+    /// the JSON manifest and the original audio). Throws when the project's
+    /// audio is no longer accessible or the archive write fails.
+    func exportArchive(project: TranscriptionProject, to destinationURL: URL) async throws {
+        try await ProjectArchive.export(project: project, to: destinationURL)
+    }
+
+    /// Imports a `.tscripty` archive into a freshly-created project. Returns
+    /// the new project's id so the caller can navigate to it. The archive's
+    /// segment, label, and edit IDs are preserved; the project itself gets a
+    /// new UUID and a fresh stored-audio filename, so importing the same
+    /// archive twice produces two distinct projects without conflicts.
+    @discardableResult
+    func importArchive(from sourceURL: URL) async throws -> UUID {
+        let accessed = sourceURL.startAccessingSecurityScopedResource()
+        defer { if accessed { sourceURL.stopAccessingSecurityScopedResource() } }
+
+        let loaded = try await ProjectArchive.load(from: sourceURL)
+        return try await materialize(loaded: loaded)
+    }
+
+    @MainActor
+    private func materialize(loaded: ProjectArchive.LoadedArchive) async throws -> UUID {
+        let manifest = loaded.manifest
+        let project = TranscriptionProject(title: manifest.project.title)
+        project.createdAt = manifest.project.createdAt
+        project.expectedSpeakerCount = manifest.project.expectedSpeakerCount
+        project.speakerOrder = manifest.project.speakerOrder
+        project.speakerNames = manifest.project.speakerNames
+        project.status = .ready
+
+        // Lay the audio down inside the sandbox under the new project's id,
+        // mirroring what AudioStorage.importAudio would have done at fresh-
+        // import time. Without this the project would have no playable audio.
+        let ext = (manifest.audioFilename as NSString).pathExtension
+        let storedFilename = ext.isEmpty
+            ? project.id.uuidString
+            : "\(project.id.uuidString).\(ext)"
+        let audioDir = try AudioStorage.audioDirectory()
+        let audioDestination = audioDir.appendingPathComponent(storedFilename)
+        try? FileManager.default.removeItem(at: audioDestination)
+        try loaded.audioData.write(to: audioDestination, options: .atomic)
+        project.storedAudioFilename = storedFilename
+
+        modelContext.insert(project)
+
+        // Reuse existing labels by name so importing doesn't duplicate the
+        // recipient's labels. Anything that doesn't match gets created with
+        // the archive's color so the visual identity carries over.
+        let existingLabels = (try? modelContext.fetch(FetchDescriptor<ProjectLabel>())) ?? []
+        let existingByName: [String: ProjectLabel] = Dictionary(
+            existingLabels.map { ($0.name.lowercased(), $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        var attachedLabels: [ProjectLabel] = []
+        for record in manifest.labels {
+            if let existing = existingByName[record.name.lowercased()] {
+                attachedLabels.append(existing)
+            } else {
+                let label = ProjectLabel(name: record.name, colorHex: record.colorHex)
+                modelContext.insert(label)
+                attachedLabels.append(label)
+            }
+        }
+        project.labels = attachedLabels
+
+        for record in manifest.segments {
+            let segment = SpeakerSegment(
+                startSeconds: record.startSeconds,
+                endSeconds: record.endSeconds,
+                speakerID: record.speakerID,
+                speakerName: record.speakerName,
+                text: record.text,
+                words: record.words,
+                embedding: record.embedding
+            )
+            // Preserve the archive's segment id so any client tooling that
+            // referenced segments by id continues to resolve.
+            segment.id = record.id
+            segment.project = project
+            modelContext.insert(segment)
+        }
+
+        try modelContext.save()
+        return project.id
     }
 
     /// Cancels any in-flight job for `project` and removes it — including the

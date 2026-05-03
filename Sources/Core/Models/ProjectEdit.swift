@@ -85,6 +85,33 @@ enum ProjectEditPayload: Codable, Equatable {
         absorbedWords: [WordTiming],
         absorbedEmbedding: [Float]
     )
+    /// One inline text edit recorded by the editor. Stores the *previous*
+    /// snapshot (text, word timings, edited flag) so undo can restore the
+    /// segment exactly as it was before the user typed.
+    case textChanged(
+        segmentID: UUID,
+        previousText: String,
+        previousWords: [WordTiming],
+        previousWasEdited: Bool
+    )
+    /// User dragged a contiguous run of words from one segment into the
+    /// chronologically-adjacent segment ("merge selection with previous /
+    /// next speaker"). We store the moved word list plus the *previous*
+    /// shape of both segments so undo can rebuild the old boundaries.
+    case wordsMoved(
+        sourceSegmentID: UUID,
+        targetSegmentID: UUID,
+        movedWords: [WordTiming],
+        sourcePreviousText: String,
+        sourcePreviousWords: [WordTiming],
+        sourcePreviousStartSeconds: Double,
+        sourcePreviousEndSeconds: Double,
+        targetPreviousText: String,
+        targetPreviousWords: [WordTiming],
+        targetPreviousStartSeconds: Double,
+        targetPreviousEndSeconds: Double,
+        movedToPrefix: Bool
+    )
 
     var kind: String {
         switch self {
@@ -94,6 +121,8 @@ enum ProjectEditPayload: Codable, Equatable {
         case .labelRemoved: "labelRemoved"
         case .segmentSplit: "split"
         case .segmentsMerged: "merge"
+        case .textChanged: "textChanged"
+        case .wordsMoved: "wordsMoved"
         }
     }
 }

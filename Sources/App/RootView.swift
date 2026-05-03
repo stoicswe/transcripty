@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import SwiftData
 
@@ -20,6 +21,8 @@ struct RootView: View {
 
     @State private var selection: SidebarDestination?
     @State private var isImporting = false
+    @State private var isImportingArchive = false
+    @State private var archiveImportError: String?
     @State private var pendingDeletion: TranscriptionProject?
     @State private var renamingProject: TranscriptionProject?
     @State private var renameDraft = ""
@@ -208,6 +211,67 @@ struct RootView: View {
         } message: { _ in
             Text("Choose a new name for this transcription project.")
         }
+        .alert(
+            "Couldn't import project archive",
+            isPresented: Binding(
+                get: { archiveImportError != nil },
+                set: { if !$0 { archiveImportError = nil } }
+            ),
+            presenting: archiveImportError
+        ) { _ in
+            Button("OK", role: .cancel) { archiveImportError = nil }
+        } message: { message in
+            Text(message)
+        }
+        .onOpenURL { url in
+            // Lets users open a `.tscripty` archive by double-clicking it in
+            // Finder or dragging it onto the app icon — same code path the
+            // sidebar import button uses.
+            guard url.pathExtension.lowercased() == ProjectArchive.fileExtension else { return }
+            performArchiveImport(from: url)
+        }
+    }
+
+    private func runArchiveImport() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [ProjectArchive.contentType]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.title = "Import Project Archive"
+        panel.message = "Choose a .tscripty archive exported from Transcripty."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        performArchiveImport(from: url)
+    }
+
+    private func performArchiveImport(from url: URL) {
+        isImportingArchive = true
+        Task {
+            defer { isImportingArchive = false }
+            do {
+                let id = try await service.importArchive(from: url)
+                selection = .project(id)
+            } catch {
+                archiveImportError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            }
+        }
+    }
+
+    private func runArchiveExport(for project: TranscriptionProject) {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [ProjectArchive.contentType]
+        panel.nameFieldStringValue = "\(project.title).\(ProjectArchive.fileExtension)"
+        panel.canCreateDirectories = true
+        panel.title = "Export Project Archive"
+        panel.message = "The archive bundles the audio, transcript, speakers, and labels into a single .tscripty file."
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        Task {
+            do {
+                try await service.exportArchive(project: project, to: destination)
+            } catch {
+                archiveImportError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            }
+        }
     }
 
     private func commitRename(for project: TranscriptionProject) {
@@ -264,6 +328,11 @@ struct RootView: View {
                             } label: {
                                 Label("Labels…", systemImage: "tag")
                             }
+                            Button {
+                                runArchiveExport(for: result.project)
+                            } label: {
+                                Label("Export Project Archive…", systemImage: "archivebox")
+                            }
                             Divider()
                             Button(role: .destructive) {
                                 pendingDeletion = result.project
@@ -289,17 +358,36 @@ struct RootView: View {
                     .buttonStyle(.bordered)
                     .controlSize(.large)
 
-                    Button {
-                        isImporting = true
+                    Menu {
+                        Button {
+                            isImporting = true
+                        } label: {
+                            Label("Import Audio File…", systemImage: "waveform.badge.plus")
+                        }
+                        Button {
+                            runArchiveImport()
+                        } label: {
+                            Label("Import Project Archive…", systemImage: "archivebox")
+                        }
+                        .disabled(isImportingArchive)
                     } label: {
-                        Image(systemName: "plus")
-                            .font(.body.weight(.semibold))
-                            .frame(maxHeight: .infinity)
-                            .padding(.horizontal, 6)
+                        if isImportingArchive {
+                            ProgressView()
+                                .controlSize(.small)
+                                .frame(maxHeight: .infinity)
+                                .padding(.horizontal, 6)
+                        } else {
+                            Image(systemName: "plus")
+                                .font(.body.weight(.semibold))
+                                .frame(maxHeight: .infinity)
+                                .padding(.horizontal, 6)
+                        }
                     }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
-                    .help("New Transcription")
+                    .help("New Transcription or Import Project Archive")
                 }
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(12)

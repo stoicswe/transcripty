@@ -28,5 +28,41 @@
 	<string>Transcripty accesses the microphone only when you record audio in the app. Recordings never leave your Mac.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>Transcripty uses on-device speech recognition to transcribe your audio files. Audio and transcripts never leave your Mac.</string>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>com.transcripty.archive</string>
+			<key>UTTypeDescription</key>
+			<string>Transcripty Project Archive</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.zip-archive</string>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>tscripty</string>
+				</array>
+			</dict>
+		</dict>
+	</array>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Transcripty Project Archive</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSHandlerRank</key>
+			<string>Owner</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.transcripty.archive</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>
