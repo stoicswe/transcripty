@@ -62,14 +62,75 @@ final class TranscriptionService {
     /// segmentation pipeline than fits this iteration.
     func retranscribe(project: TranscriptionProject, locale: Locale = .current) {
         let hints = supervisionHints(from: project)
-        // Wipe the transcript so the editor falls back to the progress view
-        // while the new run is in flight, the same way a fresh import does.
+        wipeTranscript(in: project)
+        runPipeline(for: project, locale: locale, hints: hints)
+    }
+
+    /// Re-runs the pipeline using settings the user explicitly chose in the
+    /// project's transcription-settings sheet.
+    ///
+    ///   - `expectedSpeakerCount` is written through to the project (so the
+    ///     value persists for future runs) and authoritatively drives VBx
+    ///     clustering, even if the inferred count from labels would differ.
+    ///   - `useLabels` controls whether the user's existing speaker names are
+    ///     transferred onto the new run via overlap + embedding matching. Off
+    ///     when the user wants a clean run with no transitive naming.
+    func retranscribe(
+        project: TranscriptionProject,
+        locale: Locale = .current,
+        expectedSpeakerCount: Int?,
+        useLabels: Bool
+    ) {
+        project.expectedSpeakerCount = expectedSpeakerCount
+
+        var hints = useLabels ? supervisionHints(from: project) : nil
+        if let base = hints, let count = expectedSpeakerCount {
+            // The user picked a count explicitly. That value wins over the
+            // count inferred from how many distinct speakers they labelled.
+            hints = SupervisionHints(
+                speakerCount: count,
+                namedRanges: base.namedRanges,
+                referenceEmbeddings: base.referenceEmbeddings
+            )
+        }
+
+        wipeTranscript(in: project)
+        runPipeline(for: project, locale: locale, hints: hints)
+    }
+
+    /// Wipes the transcript (segments + revision history) but keeps the audio
+    /// copy and project metadata. Use this to reset to a clean slate before a
+    /// fresh transcription run, or as a standalone "start over" action.
+    /// Cancels any in-flight job for the project first.
+    func clearTranscript(in project: TranscriptionProject) {
+        let id = project.id
+        tasks[id]?.cancel()
+        tasks.removeValue(forKey: id)
+        jobs.removeValue(forKey: id)
+
+        try? modelContext.delete(model: SpeakerSegment.self, where: #Predicate { segment in
+            segment.project?.id == id
+        })
+        try? modelContext.delete(model: ProjectEdit.self, where: #Predicate { edit in
+            edit.project?.id == id
+        })
+        project.segments.removeAll()
+        project.edits.removeAll()
+        project.speakerOrder = []
+        project.speakerNames = [:]
+        project.status = .pending
+        try? modelContext.save()
+    }
+
+    /// Drops just the segments (used between runs of `retranscribe`) without
+    /// touching audio, edit log, or speaker naming — those stay so label
+    /// transfer can still kick in on the new run.
+    private func wipeTranscript(in project: TranscriptionProject) {
         for segment in project.segments {
             modelContext.delete(segment)
         }
         project.segments.removeAll()
         try? modelContext.save()
-        runPipeline(for: project, locale: locale, hints: hints)
     }
 
     private func runPipeline(

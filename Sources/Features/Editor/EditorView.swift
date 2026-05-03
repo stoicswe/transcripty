@@ -16,7 +16,7 @@ struct EditorView: View {
     @State private var exportDocument: TranscriptTextDocument?
     @State private var isExporterPresented = false
     @State private var isHistoryPresented = false
-    @State private var isConfirmingRetranscribe = false
+    @State private var isShowingSettings = false
 
     private var job: TranscriptionService.JobState? {
         service.jobs[project.id]
@@ -36,6 +36,13 @@ struct EditorView: View {
             if let job, job.phase != .finished, project.segments.isEmpty {
                 JobProgressView(job: job, audioDuration: duration, audioURL: audioURL)
                     .frame(maxHeight: .infinity)
+            } else if project.segments.isEmpty, project.status == .pending {
+                PendingTranscriptionView(
+                    expectedSpeakerCount: project.expectedSpeakerCount,
+                    onStart: { service.start(project: project) },
+                    onOpenSettings: { isShowingSettings = true }
+                )
+                .frame(maxHeight: .infinity)
             } else {
                 TranscriptListView(
                     project: project,
@@ -80,15 +87,13 @@ struct EditorView: View {
                       ? "Nothing to undo"
                       : "Undo last edit (⌘Z)")
             }
-            if canRetranscribeWithHints {
-                ToolbarItem(placement: .primaryAction) {
-                    Button {
-                        isConfirmingRetranscribe = true
-                    } label: {
-                        Label("Re-Transcribe with Labels", systemImage: "wand.and.stars")
-                    }
-                    .help("Re-run transcription using your speaker names as supervision")
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    isShowingSettings = true
+                } label: {
+                    Label("Transcription Settings", systemImage: "slider.horizontal.3")
                 }
+                .help("Adjust speaker count, re-transcribe, or clear the transcript")
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
@@ -128,29 +133,30 @@ struct EditorView: View {
         ) { _ in
             exportDocument = nil
         }
-        .confirmationDialog(
-            "Re-transcribe with your labels?",
-            isPresented: $isConfirmingRetranscribe,
-            titleVisibility: .visible
-        ) {
-            Button("Re-Transcribe") {
-                player?.pause()
-                isPlaying = false
-                service.retranscribe(project: project)
-            }
-            Button("Cancel", role: .cancel) { }
-        } message: {
-            Text("This replaces the current transcript. The new run uses \(namedSpeakerCount) speaker\(namedSpeakerCount == 1 ? "" : "s") and re-applies your speaker names where they overlap the new turns.")
+        .sheet(isPresented: $isShowingSettings) {
+            TranscriptionSettingsSheet(
+                project: project,
+                hasNamedSpeakers: namedSpeakerCount > 0,
+                hasTranscript: !project.segments.isEmpty,
+                onCancel: { isShowingSettings = false },
+                onClearTranscript: {
+                    player?.pause()
+                    isPlaying = false
+                    service.clearTranscript(in: project)
+                    isShowingSettings = false
+                },
+                onRetranscribe: { speakerCount, useLabels in
+                    player?.pause()
+                    isPlaying = false
+                    service.retranscribe(
+                        project: project,
+                        expectedSpeakerCount: speakerCount,
+                        useLabels: useLabels
+                    )
+                    isShowingSettings = false
+                }
+            )
         }
-    }
-
-    /// Show the Re-Transcribe action only when the user has done meaningful
-    /// labeling work — at least one speaker has a custom name. With nothing
-    /// to transfer the action would just re-run the pipeline blindly, which
-    /// is what the import flow already handles.
-    private var canRetranscribeWithHints: Bool {
-        guard project.status == .ready else { return false }
-        return namedSpeakerCount > 0
     }
 
     private var namedSpeakerCount: Int {
@@ -229,6 +235,203 @@ struct EditorView: View {
             toleranceAfter: .zero
         )
         currentTime = clamped
+    }
+}
+
+// MARK: - Transcription settings sheet
+
+/// User-facing knobs for an existing project's pipeline run. Lets the user
+/// change the expected speaker count after the fact, choose whether to
+/// transfer their existing speaker labels onto the new run, and either
+/// re-transcribe or just wipe the transcript clean for a manual restart.
+private struct TranscriptionSettingsSheet: View {
+    let project: TranscriptionProject
+    let hasNamedSpeakers: Bool
+    let hasTranscript: Bool
+    let onCancel: () -> Void
+    let onClearTranscript: () -> Void
+    let onRetranscribe: (_ speakerCount: Int?, _ useLabels: Bool) -> Void
+
+    @State private var speakerCountSelection: Int?
+    @State private var useLabels: Bool
+    @State private var isConfirmingClear = false
+
+    init(
+        project: TranscriptionProject,
+        hasNamedSpeakers: Bool,
+        hasTranscript: Bool,
+        onCancel: @escaping () -> Void,
+        onClearTranscript: @escaping () -> Void,
+        onRetranscribe: @escaping (_ speakerCount: Int?, _ useLabels: Bool) -> Void
+    ) {
+        self.project = project
+        self.hasNamedSpeakers = hasNamedSpeakers
+        self.hasTranscript = hasTranscript
+        self.onCancel = onCancel
+        self.onClearTranscript = onClearTranscript
+        self.onRetranscribe = onRetranscribe
+        _speakerCountSelection = State(initialValue: project.expectedSpeakerCount)
+        _useLabels = State(initialValue: hasNamedSpeakers)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Transcription Settings")
+                    .font(.title3.weight(.semibold))
+                Text("Adjust how this project is transcribed and re-run the pipeline.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
+
+            speakerCountSection
+
+            if hasNamedSpeakers {
+                labelsSection
+            }
+
+            if hasTranscript {
+                Divider()
+                clearSection
+            }
+
+            Spacer(minLength: 8)
+
+            HStack {
+                Button("Cancel", role: .cancel, action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button {
+                    onRetranscribe(speakerCountSelection, useLabels && hasNamedSpeakers)
+                } label: {
+                    Label("Re-Transcribe", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 460)
+        .confirmationDialog(
+            "Clear this project's transcript?",
+            isPresented: $isConfirmingClear,
+            titleVisibility: .visible
+        ) {
+            Button("Clear Transcript", role: .destructive, action: onClearTranscript)
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("Removes the segments, edit history, and speaker names. The audio file stays in the project so you can transcribe it again.")
+        }
+    }
+
+    private var speakerCountSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Expected Speakers")
+                .font(.subheadline.weight(.semibold))
+            Picker("Expected Speakers", selection: $speakerCountSelection) {
+                Text("Auto").tag(Int?.none)
+                ForEach([1, 2, 3, 4, 5], id: \.self) { n in
+                    Text("\(n)").tag(Int?.some(n))
+                }
+                Text("6+").tag(Int?.some(6))
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            Text("Pinning the speaker count constrains the diarizer to that many voices, which dramatically improves separation when you know how many people are in the recording.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var labelsSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Toggle(isOn: $useLabels) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Apply my speaker names")
+                        .font(.subheadline.weight(.semibold))
+                    Text("Carries the names you've already set onto the new run, using overlap and voice-print matching.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .toggleStyle(.switch)
+        }
+    }
+
+    private var clearSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Reset")
+                .font(.subheadline.weight(.semibold))
+            HStack {
+                Text("Wipe the transcript without re-running the pipeline.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer()
+                Button(role: .destructive) {
+                    isConfirmingClear = true
+                } label: {
+                    Label("Clear Transcript", systemImage: "trash")
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Pending state CTA
+
+/// Shown when the project has no transcript and no in-flight job — typically
+/// after the user has cleared the transcript via Transcription Settings. Lets
+/// them kick off a fresh run without leaving the editor.
+private struct PendingTranscriptionView: View {
+    let expectedSpeakerCount: Int?
+    let onStart: () -> Void
+    let onOpenSettings: () -> Void
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Spacer()
+            Image(systemName: "waveform.path.ecg")
+                .font(.system(size: 56, weight: .light))
+                .foregroundStyle(.tint)
+            Text("No Transcript Yet")
+                .font(.title3.weight(.semibold))
+            Text(message)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 380)
+            HStack(spacing: 10) {
+                Button {
+                    onOpenSettings()
+                } label: {
+                    Label("Settings", systemImage: "slider.horizontal.3")
+                }
+                Button {
+                    onStart()
+                } label: {
+                    Label("Start Transcription", systemImage: "play.fill")
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            .padding(.top, 4)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var message: String {
+        switch expectedSpeakerCount {
+        case .none:
+            return "The project's audio is ready to transcribe. The diarizer will auto-detect how many speakers are present."
+        case .some(let n):
+            let suffix = n == 1 ? "" : "s"
+            return "The project's audio is ready to transcribe. It's currently set to \(n) speaker\(suffix); change this in Settings if needed."
+        }
     }
 }
 

@@ -6,8 +6,63 @@ struct SettingsView: View {
         TabView {
             AboutSettings()
                 .tabItem { Label("About", systemImage: "info.circle") }
+            StorageSettings()
+                .tabItem { Label("Storage", systemImage: "internaldrive") }
         }
         .frame(width: 480, height: 340)
+    }
+}
+
+private struct StorageSettings: View {
+    private var projectsDirectory: URL? {
+        guard let audio = try? AudioStorage.audioDirectory() else { return nil }
+        return audio.deletingLastPathComponent()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Projects on Disk")
+                .font(.headline)
+
+            Text("Transcripty stores imported audio and transcripts inside its app sandbox.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let url = projectsDirectory {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Location")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Text(url.path)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(.quaternary.opacity(0.4))
+                        )
+                }
+
+                HStack {
+                    Button {
+                        NSWorkspace.shared.activateFileViewerSelecting([url])
+                    } label: {
+                        Label("Show in Finder", systemImage: "folder")
+                    }
+                    Spacer()
+                }
+            } else {
+                Text("Couldn't locate the storage directory.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 }
 

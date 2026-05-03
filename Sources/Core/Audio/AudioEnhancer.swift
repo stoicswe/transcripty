@@ -1,22 +1,29 @@
 import Foundation
 import AVFoundation
 
-/// Writes a loudness-normalized, softly-compressed, mono 16 kHz copy of the
-/// source audio to a temp file and returns its URL, *only when the input is
-/// quiet enough to benefit*. Already-loud recordings return `nil` and the
-/// pipeline uses the original file directly — this avoids producing a very
-/// large temp file (and the associated disk/read risk) for hour-long audio
-/// that wouldn't meaningfully change from enhancement.
+/// Renders the source audio into a normalized mono 16 kHz int16 WAV temp file
+/// for the diarization + transcription models to consume. The pipeline always
+/// operates against this normalized copy regardless of the source format —
+/// stereo, multichannel, 48/96 kHz, AAC, FLAC, MP3, CAF, AIFF, etc. all reach
+/// the models in the format they actually want (which is what FluidAudio and
+/// SpeechTranscriber both expect natively).
 ///
-/// When enhancement runs, it:
-///   1. Mixes to mono (both speaker models are mono-native)
-///   2. Peak-normalizes to −3 dBFS (brings quiet recordings up)
-///   3. Applies a soft-knee compressor (−24 dBFS / 3:1) to lift soft passages
-///   4. Downsamples to 16 kHz (native rate for SpeechTranscriber and WeSpeaker)
+/// On every input the file gets:
+///   * mono mixdown
+///   * downsample to 16 kHz
+///   * encode as 16-bit PCM interleaved WAV
+///
+/// On *quiet* inputs (peak < −6 dBFS or RMS < −22 dBFS) it additionally gets:
+///   * peak normalization to −3 dBFS
+///   * a soft-knee compressor (−24 dBFS / 3:1) with 1.25× makeup
+///
+/// Loud inputs skip the level processing because amplifying them further would
+/// just clip; they still go through the format conversion so the downstream
+/// code path is uniform.
 enum AudioEnhancer {
-    /// Returns an enhanced temp-file URL only if the source needs it. `nil`
-    /// means the caller should transcribe the original file directly.
-    static func enhance(sourceURL: URL) async throws -> URL? {
+    /// Always returns a temp-file URL pointing at the normalized copy. The
+    /// caller is responsible for deleting it when the run finishes.
+    static func enhance(sourceURL: URL) async throws -> URL {
         try await Task.detached(priority: .userInitiated) {
             try enhanceSync(sourceURL: sourceURL)
         }.value
@@ -30,13 +37,13 @@ enum AudioEnhancer {
     private static let ratio: Float = 3.0
     private static let makeupGain: Float = 1.25
     private static let maxNormGain: Float = 16.0       // +24 dB cap; avoids amplifying tape hiss
-    /// Skip enhancement when *both* conditions hold:
+    /// Skip level processing when *both* conditions hold:
     ///   - the peak is already within a few dB of target (≈ −6 dBFS), so
     ///     normalization would barely move the level, AND
     ///   - the RMS is above broadcast-ish speech levels (≈ −22 dBFS), so
     ///     compression wouldn't meaningfully lift soft passages.
     /// A recording with one loud spike but mostly quiet speech will still
-    /// trip the RMS gate and get enhanced.
+    /// trip the RMS gate and get the level-enhancement chain.
     private static let skipEnhancementPeak: Float = 0.5      // −6 dBFS
     private static let skipEnhancementRMS: Float = 0.08      // −22 dBFS
 
@@ -51,19 +58,26 @@ enum AudioEnhancer {
         var rms: Float = 0
     }
 
-    private static func enhanceSync(sourceURL: URL) throws -> URL? {
+    private static func enhanceSync(sourceURL: URL) throws -> URL {
         let accessed = sourceURL.startAccessingSecurityScopedResource()
         defer { if accessed { sourceURL.stopAccessingSecurityScopedResource() } }
 
         let stats = try scanStats(url: sourceURL)
-        if stats.peak >= skipEnhancementPeak, stats.rms >= skipEnhancementRMS {
-            return nil
+        let needsLevelEnhancement = !(stats.peak >= skipEnhancementPeak && stats.rms >= skipEnhancementRMS)
+        let normGain: Float
+        if needsLevelEnhancement {
+            normGain = stats.peak > 1e-5
+                ? min(maxNormGain, targetPeak / stats.peak)
+                : 1.0
+        } else {
+            normGain = 1.0
         }
-        let normGain = stats.peak > 1e-5
-            ? min(maxNormGain, targetPeak / stats.peak)
-            : 1.0
 
-        return try processAndWrite(url: sourceURL, normGain: normGain)
+        return try processAndWrite(
+            url: sourceURL,
+            normGain: normGain,
+            applyCompression: needsLevelEnhancement
+        )
     }
 
     private static func scanStats(url: URL) throws -> Stats {
@@ -97,7 +111,11 @@ enum AudioEnhancer {
         return stats
     }
 
-    private static func processAndWrite(url: URL, normGain: Float) throws -> URL {
+    private static func processAndWrite(
+        url: URL,
+        normGain: Float,
+        applyCompression: Bool
+    ) throws -> URL {
         let inputFile = try AVAudioFile(forReading: url)
         let inputFormat = inputFile.processingFormat
         let channels = Int(inputFormat.channelCount)
@@ -125,9 +143,23 @@ enum AudioEnhancer {
             throw EnhancerError.converterInitFailed
         }
 
+        // 16-bit PCM mono interleaved WAV at 16 kHz. AVAudioFile's storage
+        // format is what we specify here; its in-memory `processingFormat` is
+        // float32, so we keep writing float32 buffers and let the file convert
+        // on the way to disk. Plain int16 WAV is the lingua franca of speech
+        // tooling — every reader downstream handles it.
         let tempURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("transcripty-enhanced-\(UUID().uuidString).caf")
-        let outputFile = try AVAudioFile(forWriting: tempURL, settings: outputFormat.settings)
+            .appendingPathComponent("transcripty-enhanced-\(UUID().uuidString).wav")
+        let fileSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: outputSampleRate,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false,
+        ]
+        let outputFile = try AVAudioFile(forWriting: tempURL, settings: fileSettings)
 
         while inputFile.framePosition < inputFile.length {
             try inputFile.read(into: inputChunk)
@@ -142,16 +174,18 @@ enum AudioEnhancer {
                 for c in 0..<channels { s += inData[c][j] }
                 s = (s / Float(channels)) * normGain
 
-                let a = abs(s)
-                if a > threshold {
-                    let overdB = 20 * log10f(a / threshold)
-                    let newA = threshold * powf(10, (overdB / ratio) / 20)
-                    s = s >= 0 ? newA : -newA
+                if applyCompression {
+                    let a = abs(s)
+                    if a > threshold {
+                        let overdB = 20 * log10f(a / threshold)
+                        let newA = threshold * powf(10, (overdB / ratio) / 20)
+                        s = s >= 0 ? newA : -newA
+                    }
+                    s *= makeupGain
                 }
 
-                var y = s * makeupGain
-                if y > 0.98 { y = 0.98 } else if y < -0.98 { y = -0.98 }
-                outMono[j] = y
+                if s > 0.98 { s = 0.98 } else if s < -0.98 { s = -0.98 }
+                outMono[j] = s
             }
             monoChunk.frameLength = AVAudioFrameCount(frames)
 

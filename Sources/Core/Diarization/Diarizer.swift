@@ -36,13 +36,16 @@ protocol Diarizer: Sendable {
 
 enum DiarizerError: LocalizedError {
     case modelPreparationFailed(underlying: any Error)
-    case audioUnreadable(URL)
+    case audioUnreadable(URL, underlying: (any Error)?)
 
     var errorDescription: String? {
         switch self {
         case .modelPreparationFailed(let underlying):
             return "Couldn't prepare the speaker-diarization models: \(underlying.localizedDescription)"
-        case .audioUnreadable(let url):
+        case .audioUnreadable(let url, let underlying):
+            if let underlying {
+                return "Couldn't read audio for diarization at \(url.path): \(underlying.localizedDescription)"
+            }
             return "Couldn't read audio for diarization at \(url.path)."
         }
     }

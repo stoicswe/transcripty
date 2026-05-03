@@ -32,7 +32,7 @@ final class FluidAudioDiarizer: Diarizer {
         do {
             result = try await manager.process(audioURL)
         } catch {
-            throw DiarizerError.audioUnreadable(audioURL)
+            throw DiarizerError.audioUnreadable(audioURL, underlying: error)
         }
 
         let segments = result.segments.map { seg in

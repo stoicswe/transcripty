@@ -42,21 +42,39 @@ struct TranscriptionPipeline {
         expectedSpeakerCount: Int? = nil,
         onProgress: @escaping @Sendable (PipelineProgress) -> Void = { _ in }
     ) async throws -> Output {
-        // Preprocess only when the source is quiet enough to benefit:
-        // AudioEnhancer returns a normalized mono 16 kHz copy, or `nil` for
-        // already-loud recordings (we then feed both models the original).
-        // Either way, playback in the editor uses the untouched source.
-        let enhancedURL = (try? await AudioEnhancer.enhance(sourceURL: audioURL)) ?? nil
+        // Always normalize the input to mono 16 kHz int16 WAV before the
+        // models touch it — this is the format both FluidAudio and Apple's
+        // SpeechTranscriber want natively, so standardizing here means stereo
+        // 48 kHz, MP3, FLAC, AAC, etc. all run through the same code path.
+        // Playback in the editor uses the untouched source either way.
+        let enhancedURL = try? await AudioEnhancer.enhance(sourceURL: audioURL)
         let workingURL = enhancedURL ?? audioURL
         defer {
             if let enhancedURL { try? FileManager.default.removeItem(at: enhancedURL) }
         }
 
-        async let diar = runDiarization(audioURL: workingURL,
-                                         expectedSpeakerCount: expectedSpeakerCount,
-                                         onProgress: onProgress)
-        async let trans = runTranscription(audioURL: workingURL, locale: locale, onProgress: onProgress)
-        let (diarOutput, transSegments) = try await (diar, trans)
+        let (diarOutput, transSegments): (DiarizationOutput, [TranscribedSegment])
+        do {
+            async let diar = runDiarization(audioURL: workingURL,
+                                             expectedSpeakerCount: expectedSpeakerCount,
+                                             onProgress: onProgress)
+            async let trans = runTranscription(audioURL: workingURL, locale: locale, onProgress: onProgress)
+            (diarOutput, transSegments) = try await (diar, trans)
+        } catch {
+            // If the normalized copy tripped a model on the way in, fall back
+            // to the original audio rather than failing the whole run. The
+            // original is what playback uses anyway, so a recovered run still
+            // lines up with the editor timeline.
+            if enhancedURL != nil {
+                async let diar = runDiarization(audioURL: audioURL,
+                                                 expectedSpeakerCount: expectedSpeakerCount,
+                                                 onProgress: onProgress)
+                async let trans = runTranscription(audioURL: audioURL, locale: locale, onProgress: onProgress)
+                (diarOutput, transSegments) = try await (diar, trans)
+            } else {
+                throw error
+            }
+        }
 
         onProgress(.merging)
         let merged = merge(diarization: diarOutput.segments, transcription: transSegments)
