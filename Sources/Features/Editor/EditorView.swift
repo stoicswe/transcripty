@@ -36,6 +36,10 @@ struct EditorView: View {
     @State private var findCaseSensitive: Bool = false
     @State private var findMatches: [FindMatch] = []
     @State private var currentFindMatchIndex: Int = 0
+    /// When false, the active-word/segment highlight and auto-scroll are
+    /// suppressed so the user can play audio aloud while editing without the
+    /// transcript jumping around. Persisted across sessions and projects.
+    @AppStorage("editor.followAlongEnabled") private var followAlongEnabled: Bool = true
 
     private var job: TranscriptionService.JobState? {
         service.jobs[project.id]
@@ -72,6 +76,7 @@ struct EditorView: View {
                 duration: duration,
                 currentTime: currentTime,
                 isPlaying: isPlaying,
+                followAlongEnabled: $followAlongEnabled,
                 onTogglePlay: togglePlay,
                 onSkip: { delta in seek(to: currentTime + delta) },
                 onScrub: { seek(to: $0) }
@@ -253,6 +258,7 @@ struct EditorView: View {
                 project: project,
                 segments: orderedSegments,
                 currentTime: currentTime,
+                followAlongEnabled: followAlongEnabled,
                 editingSegmentID: editingSegmentID,
                 currentFindMatch: currentMatchInfo,
                 onSeek: { time in seek(to: time) },
@@ -853,6 +859,11 @@ private struct TranscriptListView: View {
     let project: TranscriptionProject
     let segments: [SpeakerSegment]
     let currentTime: TimeInterval
+    /// When false, the active-segment / active-word highlight and the
+    /// playback-driven auto-scroll are suppressed. Audio still plays — this
+    /// only quiets the transcript so the user can edit without the view
+    /// chasing the playhead.
+    let followAlongEnabled: Bool
     let editingSegmentID: UUID?
     let currentFindMatch: FindMatch?
     let onSeek: (TimeInterval) -> Void
@@ -877,14 +888,22 @@ private struct TranscriptListView: View {
     /// to previous/next speaker" affordances when it forms a clean prefix
     /// or suffix of the segment.
     @State private var wordSelection: WordSelection?
+    /// Buffer for text being typed in front of a clicked word. Non-nil only
+    /// while the user is mid-insertion: opens on the first printable
+    /// keystroke after a single-point selection, closes on commit (Return),
+    /// cancel (Escape), or when the selection moves to a different anchor
+    /// (auto-commit, like clicking elsewhere in a normal text editor).
+    @State private var inlineInsertion: InlineInsertion?
     @FocusState private var transcriptFocused: Bool
 
     private var activeSegment: SpeakerSegment? {
-        segments.first(where: { $0.contains(time: currentTime) })
+        guard followAlongEnabled else { return nil }
+        return segments.first(where: { $0.contains(time: currentTime) })
     }
 
     private var activeWordAnchor: String? {
-        guard let active = activeSegment,
+        guard followAlongEnabled,
+              let active = activeSegment,
               let idx = active.activeWordIndex(at: currentTime) else { return nil }
         return "\(active.id.uuidString)-word-\(idx)"
     }
@@ -903,15 +922,17 @@ private struct TranscriptListView: View {
                     } else {
                         ForEach(Array(segments.enumerated()), id: \.element.id) { index, segment in
                             let localSelection = wordSelection?.segmentID == segment.id ? wordSelection : nil
+                            let localInsertion = inlineInsertion?.segmentID == segment.id ? inlineInsertion : nil
                             SegmentRow(
                                 project: project,
                                 segment: segment,
                                 previousSegment: index > 0 ? segments[index - 1] : nil,
                                 nextSegment: index < segments.count - 1 ? segments[index + 1] : nil,
                                 currentTime: currentTime,
-                                isActive: segment.contains(time: currentTime),
+                                isActive: followAlongEnabled && segment.contains(time: currentTime),
                                 selectionRange: localSelection?.range,
                                 splitCaretIndex: localSelection?.splitCaretIndex,
+                                inlineInsertion: localInsertion,
                                 isEditing: editingSegmentID == segment.id,
                                 findHighlightRange: currentFindMatch?.segmentID == segment.id
                                     ? currentFindMatch?.range : nil,
@@ -935,8 +956,38 @@ private struct TranscriptListView: View {
             }
             .focusable()
             .focused($transcriptFocused)
-            .onKeyPress(.return) {
-                performSplit() ? .handled : .ignored
+            // Delete / Forward-Delete go through the AppKit-level monitor
+            // because SwiftUI's `.onKeyPress` is intercepted by the AppKit
+            // responder chain for those keys (system beep, no event). The
+            // SwiftUI `.onKeyPress` hooks below still cover Escape, Return,
+            // and printable input.
+            .background(
+                DeleteKeyMonitor { handleDeleteKey() }
+            )
+            .modifier(TranscriptKeyHandlers(
+                onControlKey: handleEditorKeyPress,
+                onPrintable: { keyPress in
+                    switch keyPress.key {
+                    case .delete, .deleteForward, .escape, .return:
+                        return .ignored
+                    default:
+                        return handleEditorKeyPress(keyPress)
+                    }
+                }
+            ))
+            // Auto-commit any in-progress inline insertion when the user
+            // moves the selection (clicks a different word, shift-extends,
+            // or clears it). Mirrors how clicking elsewhere in a normal
+            // text editor commits typing rather than dropping it on the floor.
+            .onChange(of: wordSelection) { _, newValue in
+                guard let ins = inlineInsertion else { return }
+                if let sel = newValue,
+                   sel.isPoint,
+                   sel.segmentID == ins.segmentID,
+                   sel.anchor == ins.beforeWordIndex {
+                    return
+                }
+                commitInlineInsertion()
             }
             // Segment changes scroll immediately — that's the speaker-turn cue
             // the viewer expects to see.
@@ -972,6 +1023,165 @@ private struct TranscriptListView: View {
         onSplit(segment, splitIdx)
         wordSelection = nil
         return true
+    }
+
+    /// Routes every key press the transcript area receives. Inline insertion
+    /// (Return/Escape/Backspace/printable chars) wins when there's a single-
+    /// point selection; otherwise Return falls through to the existing split
+    /// behavior, and everything else is ignored so system shortcuts (⌘Z,
+    /// ⌘F, …) still reach their handlers.
+    private func handleEditorKeyPress(_ keyPress: KeyPress) -> KeyPress.Result {
+        // Don't compete with the per-segment TextField when it's focused.
+        guard editingSegmentID == nil else { return .ignored }
+
+        // Escape clears any active buffer; if there's no buffer it's not ours.
+        if keyPress.key == .escape {
+            guard inlineInsertion != nil else { return .ignored }
+            inlineInsertion = nil
+            return .handled
+        }
+
+        // Return commits when buffer is non-empty, otherwise it falls back to
+        // the split behavior so single-click + Return still splits at caret.
+        if keyPress.key == .return {
+            if inlineInsertion != nil {
+                commitInlineInsertion()
+                return .handled
+            }
+            return performSplit() ? .handled : .ignored
+        }
+
+        // Backspace (.delete) and Forward-Delete (.deleteForward) have two
+        // jobs in this view, prioritized in order:
+        //  1. Trim the in-progress inline insertion buffer when active —
+        //     same as any other text editor.
+        //  2. Otherwise, delete the currently-selected word(s) from the
+        //     segment. Single-click selects one word; shift-click extends to
+        //     a range. Both delete via `applyTextEdit`, which preserves
+        //     surviving word timings via LCS reconciliation.
+        // Forward-delete is treated identically to backspace because the
+        // buffer's cursor sits at the trailing end and a word selection
+        // doesn't have a directional cursor.
+        if keyPress.key == .delete || keyPress.key == .deleteForward {
+            if var ins = inlineInsertion, !ins.text.isEmpty {
+                ins.text.removeLast()
+                // Empty buffer collapses back to "no insertion in progress"
+                // so a stray Esc doesn't have to fire to leave the mode.
+                inlineInsertion = ins.text.isEmpty ? nil : ins
+                return .handled
+            }
+            if deleteSelectedWords() {
+                return .handled
+            }
+            return .ignored
+        }
+
+        // Printable input opens (or extends) the buffer. Anchored to the
+        // current single-point WordSelection. ⌘ / ⌃ chords are reserved for
+        // shortcuts; ⌥ stays through so option-letter unicode (é, etc.)
+        // still types as expected.
+        if keyPress.modifiers.contains(.command) || keyPress.modifiers.contains(.control) {
+            return .ignored
+        }
+        guard let sel = wordSelection, sel.isPoint else { return .ignored }
+        guard !keyPress.characters.isEmpty,
+              !keyPress.characters.unicodeScalars.contains(where: {
+                  CharacterSet.controlCharacters.contains($0)
+              })
+        else { return .ignored }
+
+        if var ins = inlineInsertion,
+           ins.segmentID == sel.segmentID,
+           ins.beforeWordIndex == sel.anchor {
+            ins.text.append(keyPress.characters)
+            inlineInsertion = ins
+        } else {
+            inlineInsertion = InlineInsertion(
+                segmentID: sel.segmentID,
+                beforeWordIndex: sel.anchor,
+                text: keyPress.characters
+            )
+        }
+        return .handled
+    }
+
+    /// AppKit-level Delete handler invoked by `DeleteKeyMonitor`. Same logic
+    /// as the Delete branch in `handleEditorKeyPress`, but lives here so the
+    /// NSEvent path can run independently of SwiftUI's key-press routing
+    /// (which doesn't reliably catch Delete on macOS — see the monitor's
+    /// header doc). Returns `true` when the press was consumed so the
+    /// monitor can swallow the event and avoid the system beep.
+    private func handleDeleteKey() -> Bool {
+        guard editingSegmentID == nil else { return false }
+        if var ins = inlineInsertion, !ins.text.isEmpty {
+            ins.text.removeLast()
+            inlineInsertion = ins.text.isEmpty ? nil : ins
+            return true
+        }
+        return deleteSelectedWords()
+    }
+
+    /// Removes the currently-selected word range from its segment. Single-
+    /// point selections drop one word; shift-extended ranges drop the whole
+    /// span. Returns true when a deletion (or the special-case merge below)
+    /// was actually applied so the caller can mark the keypress handled.
+    ///
+    /// Special case: a single-point selection at the very first word of a
+    /// segment that isn't the first segment in the project triggers a
+    /// **merge with the previous segment** instead of dropping the word.
+    /// This mirrors the Backspace-at-start-of-paragraph behavior in
+    /// standard word processors — the click + Delete reads as "this turn
+    /// shouldn't have been split here, glue it to the previous one." A
+    /// shift-extended range starting at word 0 is *not* treated this way
+    /// because the user explicitly selected a range and expects a delete.
+    @discardableResult
+    private func deleteSelectedWords() -> Bool {
+        guard let sel = wordSelection,
+              let segmentIndex = segments.firstIndex(where: { $0.id == sel.segmentID }) else {
+            return false
+        }
+        let segment = segments[segmentIndex]
+        let range = sel.range
+        guard !range.isEmpty,
+              range.lowerBound >= 0,
+              range.upperBound <= segment.words.count else {
+            return false
+        }
+
+        if sel.isPoint, sel.anchor == 0, segmentIndex > 0 {
+            let previous = segments[segmentIndex - 1]
+            wordSelection = nil
+            onMerge(previous, segment)
+            return true
+        }
+
+        var newWords = segment.words.map(\.text)
+        newWords.removeSubrange(range)
+        let newText = newWords.joined(separator: " ")
+        // applyTextEdit handles the empty-segment case (segment goes blank
+        // but stays in the list — user can merge with a neighbor or undo).
+        onCommitEditing(segment, newText)
+        wordSelection = nil
+        return true
+    }
+
+    /// Flushes the in-progress buffer into the segment's text. The buffer is
+    /// inserted in front of the anchored word; existing words are unchanged
+    /// so LCS reconciliation in `applyTextEdit` preserves their timings.
+    private func commitInlineInsertion() {
+        guard let ins = inlineInsertion else { return }
+        defer { inlineInsertion = nil }
+        let trimmed = ins.text.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        guard let segment = segments.first(where: { $0.id == ins.segmentID }) else { return }
+        let safeIndex = max(0, min(ins.beforeWordIndex, segment.words.count))
+        let words = segment.words.map(\.text)
+        var newWords: [String] = []
+        newWords.append(contentsOf: words.prefix(safeIndex))
+        newWords.append(trimmed)
+        newWords.append(contentsOf: words.suffix(from: safeIndex))
+        let newText = newWords.joined(separator: " ")
+        onCommitEditing(segment, newText)
     }
 
     /// Click handler shared by every WordTile. `extending` is true when the
@@ -1020,6 +1230,19 @@ struct WordSelection: Equatable {
     var splitCaretIndex: Int? { isPoint ? anchor : nil }
 }
 
+/// In-progress text being typed in front of a clicked word. Lives only in the
+/// editor's transient UI state — committing flushes the buffer through the
+/// regular text-edit pipeline (LCS reconciliation preserves all surrounding
+/// word timings; the inserted tokens get interpolated timings until the user
+/// runs Recompute Timings).
+struct InlineInsertion: Equatable {
+    let segmentID: UUID
+    /// Word index in front of which the buffer will be inserted. Equals the
+    /// anchor of the single-point WordSelection that opened the buffer.
+    let beforeWordIndex: Int
+    var text: String
+}
+
 enum MoveSelectionDirection: Equatable {
     case previous
     case next
@@ -1041,6 +1264,10 @@ private struct SegmentRow: View {
     /// Set when the selection collapses to a single point — that's where
     /// pressing Return splits, and also where the row paints its caret.
     let splitCaretIndex: Int?
+    /// In-progress inline insertion buffer for *this* segment (nil otherwise).
+    /// Renders as a tinted tile in front of the anchored word so the user
+    /// can see what they're typing before they commit.
+    let inlineInsertion: InlineInsertion?
     let isEditing: Bool
     /// When non-nil, the row paints this character range with a highlight to
     /// surface the current find/replace match. Restricted to the row whose
@@ -1252,6 +1479,9 @@ private struct SegmentRow: View {
         } else {
             WordFlow(spacing: 4, lineSpacing: 6) {
                 ForEach(Array(segment.words.enumerated()), id: \.offset) { index, word in
+                    if let ins = inlineInsertion, ins.beforeWordIndex == index {
+                        InlineInsertionTile(text: ins.text)
+                    }
                     if isCensoredToken(word.text) {
                         // iMessage-style "invisible ink": animated particle
                         // veil obscures the [CENSORED] core, but any suffix
@@ -1600,6 +1830,35 @@ private struct WordTile: View {
     private var foregroundStyle: HierarchicalShapeStyle {
         if isActive { return .primary }
         return isDimmed ? .secondary : .primary
+    }
+}
+
+/// Inline tile for the in-progress insertion buffer. Renders as a tinted
+/// chip with a trailing caret stripe so the user can see what's being
+/// typed and where the cursor sits relative to the surrounding words.
+private struct InlineInsertionTile: View {
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 0) {
+            // Empty buffer (just opened) shows a placeholder caret only —
+            // an empty Text would collapse to zero width and disappear.
+            Text(text.isEmpty ? " " : text)
+                .font(.body)
+                .foregroundStyle(.tint)
+            Rectangle()
+                .fill(.tint)
+                .frame(width: 1)
+                .padding(.vertical, 2)
+        }
+        .padding(.horizontal, 4)
+        .padding(.vertical, 1)
+        .background(.tint.opacity(0.18), in: RoundedRectangle(cornerRadius: 4))
+        .overlay(
+            RoundedRectangle(cornerRadius: 4)
+                .strokeBorder(.tint.opacity(0.5), lineWidth: 0.5)
+        )
+        .help("Type to insert text before the selected word. Return commits, Esc cancels.")
     }
 }
 
@@ -2082,6 +2341,7 @@ private struct PlaybackBar: View {
     let duration: TimeInterval
     let currentTime: TimeInterval
     let isPlaying: Bool
+    @Binding var followAlongEnabled: Bool
     let onTogglePlay: () -> Void
     let onSkip: (TimeInterval) -> Void
     let onScrub: (TimeInterval) -> Void
@@ -2112,6 +2372,21 @@ private struct PlaybackBar: View {
             }
             .buttonStyle(.plain)
             .disabled(audioURL == nil)
+
+            Button {
+                followAlongEnabled.toggle()
+            } label: {
+                Image(systemName: followAlongEnabled ? "eye" : "eye.slash")
+                    .font(.title3)
+                    .foregroundStyle(followAlongEnabled
+                                     ? AnyShapeStyle(.tint)
+                                     : AnyShapeStyle(.secondary))
+                    .frame(width: 32, height: 32)
+            }
+            .buttonStyle(.plain)
+            .help(followAlongEnabled
+                  ? "Follow Along is on — playback highlights and scrolls to the active word. Click to turn off."
+                  : "Follow Along is off — playback runs without highlighting or scrolling. Click to turn on.")
 
             Text(Self.format(currentTime))
                 .font(.system(.caption, design: .monospaced))
@@ -2271,6 +2546,100 @@ private struct EditorOnChangeModifier: ViewModifier {
             .onChange(of: findCaseSensitive) { _, _ in onFindCriteriaChanged() }
             .onChange(of: segmentCount) { _, _ in onSegmentCountChanged() }
             .task(id: segmentCount) { onTaskRefresh() }
+    }
+}
+
+/// Bulletproof catch for the Delete / Forward-Delete keys on macOS.
+///
+/// SwiftUI's `.onKeyPress` (both the catch-all and the explicit `keys:`
+/// form) loses races against AppKit's responder chain for keys that have
+/// built-in action selectors — Backspace maps to `deleteBackward:` and is
+/// intercepted before any SwiftUI hook fires on a non-text-input
+/// `.focusable()` view. The user-visible symptom is a system beep on every
+/// Delete press. Solution: install an application-local NSEvent keyDown
+/// monitor, which runs *before* the responder chain.
+///
+/// The Coordinator class lives across SwiftUI view rebuilds and owns the
+/// monitor handle (so we never leak monitors). `updateNSView` re-binds the
+/// callback on every render so the closure captures fresh `@State` values
+/// — without this the callback would freeze the state at install time.
+private struct DeleteKeyMonitor: NSViewRepresentable {
+    /// Returns `true` when the press was handled (event will be swallowed)
+    /// or `false` to let the system continue normal handling.
+    let onDelete: () -> Bool
+
+    final class Coordinator {
+        var monitor: Any?
+        var onDelete: (() -> Bool)?
+        weak var owningView: NSView?
+
+        init() {
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard let self else { return event }
+                // 51 = Delete (Backspace on Mac), 117 = Forward Delete.
+                guard event.keyCode == 51 || event.keyCode == 117 else { return event }
+                // Hands off when a real text input owns the focus —
+                // segment-edit TextField, find bar, rename popover, etc.
+                if let window = NSApp.keyWindow,
+                   window.firstResponder is NSTextView {
+                    return event
+                }
+                // Multi-window safety: only intercept events for the window
+                // this representable lives in.
+                if let owningWindow = self.owningView?.window,
+                   let eventWindow = event.window,
+                   owningWindow !== eventWindow {
+                    return event
+                }
+                return self.onDelete?() == true ? nil : event
+            }
+        }
+
+        deinit {
+            if let m = monitor {
+                NSEvent.removeMonitor(m)
+            }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        context.coordinator.owningView = view
+        context.coordinator.onDelete = onDelete
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.onDelete = onDelete
+    }
+}
+
+/// Wraps the transcript ScrollView's keyboard hooks. Kept as its own
+/// `ViewModifier` so the `TranscriptListView` body stays small enough for
+/// SwiftUI's type-checker — stacking five `.onKeyPress` modifiers inline
+/// alongside the existing `.onChange` chain pushes the body over the edge.
+///
+/// Two handlers are wired:
+///  * **Control keys** (Delete, Forward-Delete, Escape, Return): bound via
+///    the explicit `keys:` form so they actually fire on macOS. The
+///    catch-all `.onKeyPress(action:)` loses races against AppKit's
+///    responder chain for keys with built-in action selectors (e.g.
+///    `deleteBackward:`).
+///  * **Printable input**: catch-all that's expected to suppress the
+///    control keys itself (they already had their chance above).
+private struct TranscriptKeyHandlers: ViewModifier {
+    let onControlKey: (KeyPress) -> KeyPress.Result
+    let onPrintable: (KeyPress) -> KeyPress.Result
+
+    func body(content: Content) -> some View {
+        content
+            .onKeyPress(
+                keys: [.delete, .deleteForward, .escape, .return],
+                phases: [.down, .repeat]
+            ) { onControlKey($0) }
+            .onKeyPress(phases: [.down, .repeat]) { onPrintable($0) }
     }
 }
 

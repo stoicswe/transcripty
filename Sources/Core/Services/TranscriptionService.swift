@@ -237,7 +237,16 @@ final class TranscriptionService {
         // the diarizer originally grouped with this turn.
         segment.endSeconds = boundary
 
-        let newSpeakerID = nextAvailableSpeakerID(in: project)
+        // Pick the most likely speaker for the split-off half. In a 2-speaker
+        // project that's the other speaker; in a multi-speaker project it's
+        // the closest neighbor's speaker (the diarizer typically fuses a turn
+        // when the speaker swap is brief). Only when no plausible existing
+        // speaker exists do we mint a new one — that covers single-speaker
+        // projects or genuine new-voice cases.
+        let newSpeakerID = suggestedSpeakerIDForSplit(
+            parent: segment,
+            in: project
+        ) ?? nextAvailableSpeakerID(in: project)
         let newSegment = SpeakerSegment(
             startSeconds: boundary,
             endSeconds: originalEnd,
@@ -356,6 +365,58 @@ final class TranscriptionService {
         var n = 1
         while taken.contains("Speaker_\(n)") { n += 1 }
         return "Speaker_\(n)"
+    }
+
+    /// Best guess for which existing speaker the split-off half belongs to.
+    /// Returns `nil` when no existing speaker is a plausible candidate (e.g.
+    /// single-speaker project) — callers should mint a new speaker in that
+    /// case.
+    ///
+    /// Ranking, in order:
+    /// 1. Two-speaker project: the *other* speaker. Trivially correct.
+    /// 2. Multi-speaker: the speaker of the segment immediately following the
+    ///    parent, then the segment immediately preceding it. Diarizers fuse a
+    ///    turn most often when the swap is brief, so the bordering speaker is
+    ///    typically the one bleeding into the parent.
+    /// 3. Falls back to whichever non-parent speaker has the most segments
+    ///    project-wide — the dominant other voice is the safest default in a
+    ///    crowded conversation.
+    ///
+    /// We deliberately avoid embedding-similarity ranking here: the parent's
+    /// stored embedding is computed across the whole turn, so when half of it
+    /// is actually a different speaker the embedding is a mix and similarity
+    /// to centroids is biased. Adjacency is a stronger signal until we extract
+    /// per-slice embeddings (planned alongside per-project speaker learning).
+    private func suggestedSpeakerIDForSplit(
+        parent: SpeakerSegment,
+        in project: TranscriptionProject
+    ) -> String? {
+        let parentSpeakerID = parent.speakerID
+        let allSegments = project.segments.sorted { $0.startSeconds < $1.startSeconds }
+        let candidateIDs = Set(allSegments.map(\.speakerID)).subtracting([parentSpeakerID])
+        guard !candidateIDs.isEmpty else { return nil }
+        if candidateIDs.count == 1 { return candidateIDs.first }
+
+        if let parentIndex = allSegments.firstIndex(where: { $0.id == parent.id }) {
+            let nextSpeaker = allSegments
+                .dropFirst(parentIndex + 1)
+                .first(where: { $0.speakerID != parentSpeakerID })?
+                .speakerID
+            if let nextSpeaker, candidateIDs.contains(nextSpeaker) {
+                return nextSpeaker
+            }
+            let prevSpeaker = allSegments
+                .prefix(parentIndex)
+                .reversed()
+                .first(where: { $0.speakerID != parentSpeakerID })?
+                .speakerID
+            if let prevSpeaker, candidateIDs.contains(prevSpeaker) {
+                return prevSpeaker
+            }
+        }
+
+        let counts = Dictionary(grouping: allSegments, by: \.speakerID).mapValues(\.count)
+        return candidateIDs.max(by: { (counts[$0] ?? 0) < (counts[$1] ?? 0) })
     }
 
     // MARK: - Revision history
