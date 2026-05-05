@@ -49,6 +49,13 @@ struct EditorView: View {
         project.segments.sorted { $0.startSeconds < $1.startSeconds }
     }
 
+    /// The segment currently under the playhead. Computed independently
+    /// of `followAlongEnabled` so the drift detector keeps working even
+    /// when the user has the follow-along highlight turned off.
+    private var activePlaybackSegmentID: UUID? {
+        orderedSegments.first(where: { $0.contains(time: currentTime) })?.id
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             LabelsBar(project: project)
@@ -214,6 +221,15 @@ struct EditorView: View {
             onSegmentCountChanged: { scheduleInitialEntityScan(force: true) },
             onTaskRefresh: { scheduleInitialEntityScan(force: false) }
         ))
+        // When playback enters a new segment, ask the service whether its
+        // word timings look stale or pathological. If so, the service
+        // schedules a debounced background recompute on it. Cheap when
+        // the segment looks healthy (returns immediately).
+        .onChange(of: activePlaybackSegmentID) { _, newID in
+            guard let newID,
+                  let segment = orderedSegments.first(where: { $0.id == newID }) else { return }
+            service.scheduleDriftRecomputeIfNeeded(for: segment, in: project)
+        }
         .sheet(isPresented: $isEntityScanPresented) {
             EntityScanSheet(
                 groups: entityGroups,
@@ -229,6 +245,7 @@ struct EditorView: View {
                 project: project,
                 hasNamedSpeakers: namedSpeakerCount > 0,
                 hasTranscript: !project.segments.isEmpty,
+                isRecomputingTimings: isRecomputingTimings,
                 onCancel: { isShowingSettings = false },
                 onClearTranscript: {
                     player?.pause()
@@ -245,6 +262,10 @@ struct EditorView: View {
                         useLabels: useLabels
                     )
                     isShowingSettings = false
+                },
+                onRecomputeTimings: {
+                    isShowingSettings = false
+                    runRecomputeTimings(forceAll: true)
                 }
             )
         }
@@ -323,7 +344,12 @@ struct EditorView: View {
 
     // MARK: - Recompute timings
 
-    private func runRecomputeTimings() {
+    /// `forceAll` aligns every segment, not just the ones flagged
+    /// `wasEdited`. The floating badge fires the default scope (edited
+    /// segments only); the manual button in Transcription Settings sets
+    /// `forceAll = true` so the user can resync playback even when no
+    /// edits have been made.
+    private func runRecomputeTimings(forceAll: Bool = false) {
         guard !isRecomputingTimings else { return }
         isRecomputingTimings = true
         recomputeProgress = 0
@@ -332,7 +358,10 @@ struct EditorView: View {
                 isRecomputingTimings = false
             }
             do {
-                try await service.recomputeTimings(for: project) { fraction in
+                try await service.recomputeTimings(
+                    for: project,
+                    includeAll: forceAll
+                ) { fraction in
                     Task { @MainActor in recomputeProgress = fraction }
                 }
             } catch {
@@ -666,9 +695,14 @@ private struct TranscriptionSettingsSheet: View {
     let project: TranscriptionProject
     let hasNamedSpeakers: Bool
     let hasTranscript: Bool
+    /// Whether a recompute is already in flight — drives the button's
+    /// spinner state so the user can't kick a second pass while one is
+    /// running.
+    let isRecomputingTimings: Bool
     let onCancel: () -> Void
     let onClearTranscript: () -> Void
     let onRetranscribe: (_ speakerCount: Int?, _ useLabels: Bool) -> Void
+    let onRecomputeTimings: () -> Void
 
     @State private var speakerCountSelection: Int?
     @State private var useLabels: Bool
@@ -678,16 +712,20 @@ private struct TranscriptionSettingsSheet: View {
         project: TranscriptionProject,
         hasNamedSpeakers: Bool,
         hasTranscript: Bool,
+        isRecomputingTimings: Bool,
         onCancel: @escaping () -> Void,
         onClearTranscript: @escaping () -> Void,
-        onRetranscribe: @escaping (_ speakerCount: Int?, _ useLabels: Bool) -> Void
+        onRetranscribe: @escaping (_ speakerCount: Int?, _ useLabels: Bool) -> Void,
+        onRecomputeTimings: @escaping () -> Void
     ) {
         self.project = project
         self.hasNamedSpeakers = hasNamedSpeakers
         self.hasTranscript = hasTranscript
+        self.isRecomputingTimings = isRecomputingTimings
         self.onCancel = onCancel
         self.onClearTranscript = onClearTranscript
         self.onRetranscribe = onRetranscribe
+        self.onRecomputeTimings = onRecomputeTimings
         _speakerCountSelection = State(initialValue: project.expectedSpeakerCount)
         _useLabels = State(initialValue: hasNamedSpeakers)
     }
@@ -711,6 +749,8 @@ private struct TranscriptionSettingsSheet: View {
             }
 
             if hasTranscript {
+                Divider()
+                wordTimingSection
                 Divider()
                 clearSection
             }
@@ -777,6 +817,37 @@ private struct TranscriptionSettingsSheet: View {
                 }
             }
             .toggleStyle(.switch)
+        }
+    }
+
+    /// Always-available "Recompute Word Timings" affordance. The editor
+    /// also shows the floating badge automatically when at least one
+    /// segment has been edited, but having a manual button here lets the
+    /// user force a fresh forced-alignment pass even when nothing is
+    /// flagged — useful when playback feels visually out of sync but the
+    /// underlying flags say everything's fine.
+    private var wordTimingSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Word Timing Alignment")
+                .font(.subheadline.weight(.semibold))
+            Text("Re-extracts each segment's audio and re-runs the recognizer to refresh per-word playback timings. Use this when the playback highlight feels misaligned with what's being spoken.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button {
+                onRecomputeTimings()
+            } label: {
+                if isRecomputingTimings {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Recomputing…")
+                    }
+                } else {
+                    Label("Recompute Word Timings", systemImage: "waveform.path.badge.plus")
+                }
+            }
+            .buttonStyle(.bordered)
+            .disabled(isRecomputingTimings)
         }
     }
 
@@ -945,7 +1016,14 @@ private struct TranscriptListView: View {
                                     handleMoveSelection(segment: segment, direction: direction)
                                 },
                                 onBeginEditing: { onBeginEditing(segment.id) },
-                                onCommitEditing: { newText in onCommitEditing(segment, newText) },
+                                onCommitEditing: { newText in
+                                    onCommitEditing(segment, newText)
+                                    // Drop any caret/word selection so the
+                                    // row visually settles back to "no
+                                    // active interaction" once the user's
+                                    // edit lands.
+                                    wordSelection = nil
+                                },
                                 onCancelEditing: onCancelEditing
                             )
                             .id(segment.id.uuidString)
@@ -1168,6 +1246,8 @@ private struct TranscriptListView: View {
     /// Flushes the in-progress buffer into the segment's text. The buffer is
     /// inserted in front of the anchored word; existing words are unchanged
     /// so LCS reconciliation in `applyTextEdit` preserves their timings.
+    /// Clears the word selection on success so the caret-style highlight
+    /// goes away — the user has finished interacting with that word.
     private func commitInlineInsertion() {
         guard let ins = inlineInsertion else { return }
         defer { inlineInsertion = nil }
@@ -1182,6 +1262,7 @@ private struct TranscriptListView: View {
         newWords.append(contentsOf: words.suffix(from: safeIndex))
         let newText = newWords.joined(separator: " ")
         onCommitEditing(segment, newText)
+        wordSelection = nil
     }
 
     /// Click handler shared by every WordTile. `extending` is true when the
@@ -1283,6 +1364,7 @@ private struct SegmentRow: View {
 
     @Environment(\.modelContext) private var modelContext
     @Environment(TranscriptionService.self) private var service
+    @Environment(SpeakerVoicePrintService.self) private var voicePrintService
     @State private var isEditingName = false
     @State private var draftName = ""
     @State private var draftText = ""
@@ -1294,6 +1376,16 @@ private struct SegmentRow: View {
 
     private var activeWordIndex: Int? {
         isActive ? segment.activeWordIndex(at: currentTime) : nil
+    }
+
+    /// The split candidate (if any) that lands *before* the given word
+    /// index. Used by the WordFlow render loop to inject inline speaker-
+    /// change markers between specific words.
+    private func splitCandidate(at wordIndex: Int) -> SpeakerVoicePrintService.SplitCandidate? {
+        guard case .results(let candidates) = voicePrintService.detectionState(for: segment.id) else {
+            return nil
+        }
+        return candidates.first(where: { $0.beforeWordIndex == wordIndex })
     }
 
     var body: some View {
@@ -1353,6 +1445,8 @@ private struct SegmentRow: View {
                     )
                     .contextMenu { contextMenuContent }
                 moveSelectionBar
+                relabelSuggestionBar
+                mixedSpeakerBar
             }
         }
         .animation(.easeInOut(duration: 0.15), value: isActive)
@@ -1375,6 +1469,13 @@ private struct SegmentRow: View {
         }
         Divider()
         mergeMenuContent
+        Divider()
+        Button(role: .destructive) {
+            service.deleteSegment(segment, in: project)
+        } label: {
+            Label("Delete Block", systemImage: "trash")
+        }
+        .help("Delete this entire segment. Undoable from the Undo button or ⌘Z.")
     }
 
     /// Floating bar offering "Move … to Previous/Next Speaker" when the
@@ -1426,6 +1527,195 @@ private struct SegmentRow: View {
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
+    }
+
+    /// Inline relabel-suggestion pill. Shown when the project's per-speaker
+    /// voice-print centroids point at a different speaker more confidently
+    /// than this segment's currently-assigned label. Two affordances:
+    ///   * **Reassign** — accept the suggestion. Calls
+    ///     `service.relabelSegment` which updates the speakerID, records an
+    ///     undoable `.segmentSpeakerChanged` edit, and triggers a centroid
+    ///     recompute (so adjacent segments re-evaluate against the now-
+    ///     slightly-pulled centroids).
+    ///   * **Dismiss** — confirm the current label is correct. Calls
+    ///     `service.dismissRelabelSuggestion` which suppresses the pill for
+    ///     this segment and weights it 2× toward the current speaker on
+    ///     the next centroid recompute. That positive evidence tightens
+    ///     the centroid for future suggestions on *other* segments.
+    /// Editing modes hide the pill so it doesn't compete with the edit
+    /// affordances; a suggestion pill while typing would be visually busy.
+    @ViewBuilder
+    private var relabelSuggestionBar: some View {
+        if !isEditing,
+           selectionRange == nil,
+           inlineInsertion == nil,
+           let suggestion = voicePrintService.suggestion(for: segment, in: project) {
+            HStack(spacing: 8) {
+                Image(systemName: "person.crop.circle.badge.questionmark")
+                    .foregroundStyle(.tint)
+                Text("Sounds more like \(suggestion.suggestedDisplayName)?")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.primary)
+                Spacer()
+                Button {
+                    service.relabelSegment(segment, toSpeakerID: suggestion.suggestedSpeakerID, in: project)
+                } label: {
+                    Label("Reassign", systemImage: "checkmark")
+                        .labelStyle(.titleAndIcon)
+                }
+                .buttonStyle(.bordered)
+                .help(String(format: "Reassign this segment to %@ (similarity %.2f vs. %.2f).",
+                             suggestion.suggestedDisplayName,
+                             suggestion.suggestedSimilarity,
+                             suggestion.currentSimilarity))
+                Button {
+                    service.dismissRelabelSuggestion(for: segment, in: project)
+                } label: {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.bordered)
+                .help("Dismiss — keep this segment as \(project.displayName(forSpeakerID: segment.speakerID)). The voice-print model will weight this segment toward the current speaker.")
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(.regularMaterial, in: Capsule())
+            .overlay(Capsule().strokeBorder(.tint.opacity(0.3), lineWidth: 0.5))
+            .transition(.opacity.combined(with: .move(edge: .top)))
+        }
+    }
+
+    /// Mid-segment speaker-change pill (Path B). Has four states the user
+    /// can land in:
+    ///   1. **Idle flag** — voice-print heuristic flagged this segment as
+    ///      potentially mixed. User can click "Detect" to run the diarizer
+    ///      on the segment's audio range, or dismiss the flag.
+    ///   2. **Running** — diarizer is loading + processing. Spinner only;
+    ///      no buttons. Worth a beat: the diarizer reloads its CoreML
+    ///      models per call (FluidAudio doesn't expose a public cache),
+    ///      so the first few seconds are model-load.
+    ///   3. **No changes found** — diarizer didn't see a second speaker
+    ///      inside this segment. User can dismiss to mark the segment
+    ///      as checked.
+    ///   4. **Failed** — audio missing, diarizer error, etc. Dismissable.
+    ///
+    /// The "results" state is *not* shown as a pill — split candidates
+    /// render as inline markers between words inside the WordFlow itself
+    /// so the user picks the actual split point inline.
+    /// Hidden during edit / selection / typing modes for the same reason
+    /// as the other pills: no point competing with the user's active
+    /// interaction.
+    @ViewBuilder
+    private var mixedSpeakerBar: some View {
+        if !isEditing,
+           selectionRange == nil,
+           inlineInsertion == nil {
+            let detectionState = voicePrintService.detectionState(for: segment.id)
+            switch detectionState {
+            case .running:
+                mixedSpeakerPill {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Analyzing speakers in this segment…")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.primary)
+                        Spacer()
+                    }
+                }
+            case .noChangesFound:
+                mixedSpeakerPill {
+                    HStack(spacing: 8) {
+                        Image(systemName: "checkmark.circle")
+                            .foregroundStyle(.tint)
+                        Text("No speaker changes detected.")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.primary)
+                        Spacer()
+                        Button {
+                            voicePrintService.clearDetectionState(for: segment.id)
+                            service.markMixedSpeakerSegmentChecked(segment, in: project)
+                        } label: {
+                            Image(systemName: "xmark")
+                        }
+                        .buttonStyle(.bordered)
+                        .help("Dismiss")
+                    }
+                }
+            case .failed(let message):
+                mixedSpeakerPill {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle")
+                            .foregroundStyle(.orange)
+                        Text("Couldn't analyze: \(message)")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.primary)
+                            .lineLimit(2)
+                        Spacer()
+                        Button {
+                            voicePrintService.clearDetectionState(for: segment.id)
+                        } label: {
+                            Image(systemName: "xmark")
+                        }
+                        .buttonStyle(.bordered)
+                        .help("Dismiss")
+                    }
+                }
+            case .results, .none:
+                // Idle flag only when no detection has run. Suppress when
+                // results are present (those render as inline markers
+                // inside the WordFlow instead).
+                if detectionState == nil,
+                   voicePrintService.mixedSpeakerCandidate(for: segment, in: project) {
+                    mixedSpeakerPill {
+                        HStack(spacing: 8) {
+                            Image(systemName: "person.2.wave.2")
+                                .foregroundStyle(.tint)
+                            Text("This segment may contain multiple speakers.")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.primary)
+                            Spacer()
+                            Button {
+                                Task {
+                                    await voicePrintService.detectSpeakerChanges(for: segment, in: project)
+                                    // After detection settles, mark the
+                                    // segment as checked so the idle flag
+                                    // doesn't reappear if the user dismisses
+                                    // results without splitting. Only mark
+                                    // checked on success; failure leaves
+                                    // the flag available so they can retry.
+                                    if let state = voicePrintService.detectionState(for: segment.id),
+                                       case .failed = state {
+                                        return
+                                    }
+                                    service.markMixedSpeakerSegmentChecked(segment, in: project)
+                                }
+                            } label: {
+                                Label("Detect", systemImage: "waveform.badge.magnifyingglass")
+                                    .labelStyle(.titleAndIcon)
+                            }
+                            .buttonStyle(.bordered)
+                            .help("Run a focused diarization pass on this segment's audio. Takes a few seconds — the speaker-detection model has to load before analyzing.")
+                            Button {
+                                service.markMixedSpeakerSegmentChecked(segment, in: project)
+                            } label: {
+                                Image(systemName: "xmark")
+                            }
+                            .buttonStyle(.bordered)
+                            .help("Dismiss — don't ask again on this segment.")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func mixedSpeakerPill<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        content()
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(.regularMaterial, in: Capsule())
+            .overlay(Capsule().strokeBorder(.tint.opacity(0.3), lineWidth: 0.5))
+            .transition(.opacity.combined(with: .move(edge: .top)))
     }
 
     /// Context-menu items for combining this segment with a neighbor. The
@@ -1481,6 +1771,26 @@ private struct SegmentRow: View {
                 ForEach(Array(segment.words.enumerated()), id: \.offset) { index, word in
                     if let ins = inlineInsertion, ins.beforeWordIndex == index {
                         InlineInsertionTile(text: ins.text)
+                    }
+                    if let candidate = splitCandidate(at: index) {
+                        SplitCandidateMarker(
+                            candidate: candidate,
+                            onAccept: {
+                                _ = service.acceptSpeakerChangeCandidate(
+                                    wordIndex: candidate.beforeWordIndex,
+                                    suggestedSpeakerID: candidate.suggestedSpeakerID,
+                                    in: segment,
+                                    in: project
+                                )
+                                // The split rewrites segment.id territory;
+                                // clear cached results so the post-split
+                                // halves can be re-evaluated independently.
+                                voicePrintService.clearDetectionState(for: segment.id)
+                            },
+                            onDismiss: {
+                                voicePrintService.dismissCandidate(candidate, for: segment.id)
+                            }
+                        )
                     }
                     if isCensoredToken(word.text) {
                         // iMessage-style "invisible ink": animated particle
@@ -1833,6 +2143,62 @@ private struct WordTile: View {
     }
 }
 
+/// Inline marker rendered between two words inside `WordFlow` when the
+/// mid-segment detector finds a speaker change at that boundary. Visual:
+/// a vertical seam + tappable badge "→ Alice ✓✕". Accept performs the
+/// split + relabel; dismiss removes just this candidate from the cached
+/// results without touching the others.
+private struct SplitCandidateMarker: View {
+    let candidate: SpeakerVoicePrintService.SplitCandidate
+    let onAccept: () -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Rectangle()
+                .fill(.tint)
+                .frame(width: 1, height: 16)
+            HStack(spacing: 4) {
+                Image(systemName: "arrow.down.forward")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tint)
+                Text(candidate.suggestedDisplayName)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tint)
+                Button(action: onAccept) {
+                    Image(systemName: "checkmark")
+                        .font(.caption2.weight(.bold))
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 4)
+                .padding(.vertical, 2)
+                .background(.tint.opacity(0.18), in: Capsule())
+                .foregroundStyle(.tint)
+                .help(String(format: "Split here and label as %@ (confidence %.2f).",
+                             candidate.suggestedDisplayName,
+                             candidate.confidence))
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.caption2.weight(.bold))
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 4)
+                .padding(.vertical, 2)
+                .background(.secondary.opacity(0.18), in: Capsule())
+                .foregroundStyle(.secondary)
+                .help("Dismiss this suggestion. The voice-print model keeps learning from your other choices.")
+            }
+            .padding(.horizontal, 4)
+            .padding(.vertical, 2)
+            .background(.tint.opacity(0.08), in: RoundedRectangle(cornerRadius: 4))
+            .overlay(
+                RoundedRectangle(cornerRadius: 4)
+                    .strokeBorder(.tint.opacity(0.4), lineWidth: 0.5)
+            )
+        }
+    }
+}
+
 /// Inline tile for the in-progress insertion buffer. Renders as a tinted
 /// chip with a trailing caret stripe so the user can see what's being
 /// typed and where the cursor sits relative to the surrounding words.
@@ -1983,6 +2349,8 @@ private struct RevisionRow: View {
         case "split": "scissors"
         case "merge": "arrow.merge"
         case "textChanged": "pencil.and.outline"
+        case "speakerReassigned": "person.crop.circle.badge.checkmark"
+        case "segmentDeleted": "trash"
         case "wordsMoved": "arrow.left.arrow.right"
         default: "pencil"
         }

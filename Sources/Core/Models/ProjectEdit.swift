@@ -94,6 +94,31 @@ enum ProjectEditPayload: Codable, Equatable {
         previousWords: [WordTiming],
         previousWasEdited: Bool
     )
+    /// User reassigned a segment to a different speaker — typically by
+    /// accepting an inline relabel suggestion ("sounds more like Alice?").
+    /// Carries the previous speakerID + display name so undo restores the
+    /// original assignment exactly.
+    case segmentSpeakerChanged(
+        segmentID: UUID,
+        previousSpeakerID: String,
+        previousSpeakerName: String
+    )
+    /// User deleted an entire segment (right-click → Delete Block). The
+    /// payload captures everything needed to recreate the segment on undo:
+    /// position, speaker assignment, text, words, and embedding. The
+    /// recreated segment gets a new UUID; any history payloads that
+    /// referenced the original ID stay valid because they were recorded
+    /// against the live segment at that point in time.
+    case segmentDeleted(
+        startSeconds: Double,
+        endSeconds: Double,
+        speakerID: String,
+        speakerName: String,
+        text: String,
+        words: [WordTiming],
+        embedding: [Float],
+        wasEdited: Bool
+    )
     /// User dragged a contiguous run of words from one segment into the
     /// chronologically-adjacent segment ("merge selection with previous /
     /// next speaker"). We store the moved word list plus the *previous*
@@ -122,6 +147,8 @@ enum ProjectEditPayload: Codable, Equatable {
         case .segmentSplit: "split"
         case .segmentsMerged: "merge"
         case .textChanged: "textChanged"
+        case .segmentSpeakerChanged: "speakerReassigned"
+        case .segmentDeleted: "segmentDeleted"
         case .wordsMoved: "wordsMoved"
         }
     }

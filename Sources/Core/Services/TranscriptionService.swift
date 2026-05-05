@@ -29,6 +29,13 @@ final class TranscriptionService {
     private let pipeline: TranscriptionPipeline
     private let modelContext: ModelContext
     private var tasks: [UUID: Task<Void, Never>] = [:]
+    /// Per-project debounced auto-recompute task. A flurry of edits within
+    /// the debounce window collapses into one recompute pass at the end.
+    private var pendingAutoRecompute: [UUID: Task<Void, Never>] = [:]
+    /// Long-lived background-healer task. Non-nil only while the user has
+    /// the toggle on in Preferences; nil otherwise so it doesn't burn CPU
+    /// on by-default behavior.
+    private var backgroundHealer: Task<Void, Never>?
 
     init(
         modelContext: ModelContext,
@@ -274,7 +281,13 @@ final class TranscriptionService {
             summary: "Split into \(project.displayName(forSpeakerID: newSpeakerID))",
             in: project
         )
+        // Both halves cross a boundary the original alignment didn't know
+        // about, so flag them for the auto-recompute pass to refresh.
+        segment.wasEdited = true
+        newSegment.wasEdited = true
         try? modelContext.save()
+        recomputeSpeakerCentroids(in: project)
+        scheduleAutoRecompute(in: project)
         return newSegment
     }
 
@@ -344,8 +357,157 @@ final class TranscriptionService {
             in: project,
             contextSegmentID: first.id
         )
+        // The survivor's word boundaries now span both turns; flag so the
+        // auto-recompute pass refreshes the alignment.
+        first.wasEdited = true
         try? modelContext.save()
+        recomputeSpeakerCentroids(in: project)
+        scheduleAutoRecompute(in: project)
         return first
+    }
+
+    /// Removes a segment outright. Records the segment's full state in the
+    /// revision history so undo can recreate it (the recreated segment
+    /// gets a fresh UUID; that's fine because no live payloads outlive
+    /// this call still pointing at the old one). Triggers a centroid
+    /// recompute since the speaker landscape changed.
+    func deleteSegment(
+        _ segment: SpeakerSegment,
+        in project: TranscriptionProject
+    ) {
+        guard project.segments.contains(where: { $0.id == segment.id }) else { return }
+        let summary = "Deleted segment from \(project.displayName(forSpeakerID: segment.speakerID))"
+        recordEdit(
+            .segmentDeleted(
+                startSeconds: segment.startSeconds,
+                endSeconds: segment.endSeconds,
+                speakerID: segment.speakerID,
+                speakerName: segment.speakerName,
+                text: segment.text,
+                words: segment.words,
+                embedding: segment.embedding,
+                wasEdited: segment.wasEdited
+            ),
+            summary: summary,
+            in: project
+        )
+        // Drop the relabel-dismissal hint and the mixed-speaker checked
+        // marker — both keyed by the about-to-be-deleted segment ID and
+        // serve no purpose post-delete.
+        project.dismissedRelabelSuggestions.removeAll { $0 == segment.id }
+        project.checkedMixedSpeakerSegments.removeAll { $0 == segment.id }
+        modelContext.delete(segment)
+        try? modelContext.save()
+        recomputeSpeakerCentroids(in: project)
+    }
+
+    /// Reassigns a segment to a different existing speaker. Records the
+    /// previous identity in the revision history so undo can restore it,
+    /// clears any prior dismissal feedback for this segment (so the user's
+    /// new pick is what trains the centroids next), and kicks a centroid
+    /// recompute so the inline suggestion engine reflects the change.
+    /// No-ops when `newSpeakerID` matches the current assignment.
+    @discardableResult
+    func relabelSegment(
+        _ segment: SpeakerSegment,
+        toSpeakerID newSpeakerID: String,
+        in project: TranscriptionProject
+    ) -> Bool {
+        guard project.segments.contains(where: { $0.id == segment.id }) else { return false }
+        guard segment.speakerID != newSpeakerID else { return false }
+        let previousSpeakerID = segment.speakerID
+        let previousSpeakerName = segment.speakerName
+        let newDisplayName = project.displayName(forSpeakerID: newSpeakerID)
+
+        segment.speakerID = newSpeakerID
+        segment.speakerName = newDisplayName
+        // A confirmed dismissal would have biased the centroid for the
+        // *old* speaker; the user's reassignment overrules that, so clear
+        // it before recomputing.
+        project.dismissedRelabelSuggestions.removeAll { $0 == segment.id }
+
+        recordEdit(
+            .segmentSpeakerChanged(
+                segmentID: segment.id,
+                previousSpeakerID: previousSpeakerID,
+                previousSpeakerName: previousSpeakerName
+            ),
+            summary: "Reassigned segment to \(newDisplayName)",
+            in: project,
+            contextSegmentID: segment.id
+        )
+        try? modelContext.save()
+        recomputeSpeakerCentroids(in: project)
+        return true
+    }
+
+    /// Accepts a mid-segment speaker-change candidate from the inline
+    /// detector: splits the parent segment at the candidate's word index
+    /// and relabels the resulting *second half* to the suggested speaker.
+    /// Returns the new (second-half) segment, or `nil` when the split or
+    /// relabel can't be applied.
+    ///
+    /// Why split-then-relabel-the-second-half: the candidate's
+    /// `beforeWordIndex` marks where the *new* speaker starts speaking, so
+    /// after the split the second half is the new-speaker territory. The
+    /// existing `splitSegment` machinery handles the cut + records an
+    /// undoable `.segmentSplit` edit; we then call `relabelSegment` on
+    /// the new segment to set the suggested speaker, which records its own
+    /// undoable `.segmentSpeakerChanged` edit. Two separate edits in the
+    /// history is intentional — the user can undo the relabel without
+    /// reverting the split if they decide the cut was right but the label
+    /// wasn't.
+    @discardableResult
+    func acceptSpeakerChangeCandidate(
+        wordIndex: Int,
+        suggestedSpeakerID: String,
+        in segment: SpeakerSegment,
+        in project: TranscriptionProject
+    ) -> SpeakerSegment? {
+        guard let newSegment = splitSegment(segment, atWordIndex: wordIndex, in: project) else {
+            return nil
+        }
+        // splitSegment already auto-suggests a speaker for the new half via
+        // adjacency heuristics; if it picked something other than what
+        // the voice-print detection indicates, override it.
+        if newSegment.speakerID != suggestedSpeakerID {
+            relabelSegment(newSegment, toSpeakerID: suggestedSpeakerID, in: project)
+        }
+        return newSegment
+    }
+
+    /// Records that the user explicitly confirmed a segment's current
+    /// speaker label despite the suggestion engine flagging it for relabel.
+    /// Stops the suggestion from re-appearing for that segment, and the
+    /// next centroid recompute weights this segment 2× toward its current
+    /// speaker — pulling the centroid toward a known-good example, which
+    /// tightens classifications on the *other* segments. Idempotent.
+    func dismissRelabelSuggestion(
+        for segment: SpeakerSegment,
+        in project: TranscriptionProject
+    ) {
+        guard project.segments.contains(where: { $0.id == segment.id }) else { return }
+        if !project.dismissedRelabelSuggestions.contains(segment.id) {
+            project.dismissedRelabelSuggestions.append(segment.id)
+        }
+        try? modelContext.save()
+        recomputeSpeakerCentroids(in: project)
+    }
+
+    /// Suppresses the "may contain multiple speakers" flag for a segment.
+    /// Called both when the user dismisses the flag without running
+    /// detection ("don't ask again") and after a successful detection
+    /// settles — once the user has seen the result, re-flagging would be
+    /// nagging. Idempotent.
+    func markMixedSpeakerSegmentChecked(
+        _ segment: SpeakerSegment,
+        in project: TranscriptionProject
+    ) {
+        guard project.segments.contains(where: { $0.id == segment.id }) else { return }
+        if !project.checkedMixedSpeakerSegments.contains(segment.id) {
+            project.checkedMixedSpeakerSegments.append(segment.id)
+        }
+        try? modelContext.save()
     }
 
     /// Element-wise mean of two embeddings. Returns whichever non-empty one
@@ -453,6 +615,10 @@ final class TranscriptionService {
         applyInverse(of: payload, in: project)
         modelContext.delete(edit)
         try? modelContext.save()
+        // Most edit kinds change which segments belong to which speaker, so
+        // a centroid recompute keeps the suggestion engine honest. Cheap
+        // when the centroids are stable (same numbers fall out the math).
+        recomputeSpeakerCentroids(in: project)
         return edit
     }
 
@@ -539,6 +705,30 @@ final class TranscriptionService {
             segment.text = previousText
             segment.words = previousWords
             segment.wasEdited = previousWasEdited
+
+        case let .segmentSpeakerChanged(segmentID, previousSpeakerID, previousSpeakerName):
+            guard let segment = project.segments.first(where: { $0.id == segmentID }) else { return }
+            segment.speakerID = previousSpeakerID
+            segment.speakerName = previousSpeakerName
+            // The redo state may have stamped this segment as user-confirmed
+            // when the relabel happened; clearing it lets the suggestion
+            // engine re-evaluate after the undo lands.
+            project.dismissedRelabelSuggestions.removeAll { $0 == segmentID }
+
+        case let .segmentDeleted(startSeconds, endSeconds, speakerID, speakerName,
+                                  text, words, embedding, wasEdited):
+            let recreated = SpeakerSegment(
+                startSeconds: startSeconds,
+                endSeconds: endSeconds,
+                speakerID: speakerID,
+                speakerName: speakerName,
+                text: text,
+                words: words,
+                embedding: embedding
+            )
+            recreated.wasEdited = wasEdited
+            recreated.project = project
+            modelContext.insert(recreated)
 
         case let .wordsMoved(sourceID, targetID, _,
                               srcText, srcWords, srcStart, srcEnd,
@@ -881,6 +1071,83 @@ final class TranscriptionService {
         return vector.map { $0 * scale }
     }
 
+    // MARK: - Speaker centroid maintenance
+
+    /// Recomputes `project.speakerCentroids` from the current segment
+    /// embeddings. Called after every speaker-affecting edit (split, merge,
+    /// word move, relabel, dismiss-relabel) so the editor's suggestion
+    /// engine always works against fresh data.
+    ///
+    /// Math: each speaker's centroid is the L2-normalized mean of its
+    /// segments' embeddings, with segments the user has explicitly
+    /// confirmed (via dismissed-suggestion feedback) counted at 2× weight.
+    /// Doubling the weight pulls the centroid toward known-good examples,
+    /// which tightens classifications going forward.
+    ///
+    /// Snapshots the embeddings on the main actor before doing the math —
+    /// SwiftData `@Model` values aren't `Sendable`, so we can't carry them
+    /// across actors. The math itself is dispatched to a utility-priority
+    /// detached task so long transcripts don't stall the UI; the result
+    /// is written back on the main actor.
+    func recomputeSpeakerCentroids(in project: TranscriptionProject) {
+        let dismissed = Set(project.dismissedRelabelSuggestions)
+        let samples: [(speakerID: String, embedding: [Float], weight: Float)] =
+            project.segments.compactMap { segment in
+                guard !segment.embedding.isEmpty else { return nil }
+                let weight: Float = dismissed.contains(segment.id) ? 2.0 : 1.0
+                return (segment.speakerID, segment.embedding, weight)
+            }
+        let projectID = project.id
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            let centroids = Self.computeWeightedCentroids(from: samples)
+            await MainActor.run {
+                guard let project = self.fetchProject(projectID) else { return }
+                project.speakerCentroids = centroids
+                try? self.modelContext.save()
+            }
+        }
+    }
+
+    /// Pure function: groups samples by speakerID, computes the L2-
+    /// normalized weighted mean of each group's embeddings. `nonisolated`
+    /// so `Task.detached` can call it without crossing the main-actor
+    /// boundary on the inputs (which are plain `Sendable` tuples).
+    nonisolated private static func computeWeightedCentroids(
+        from samples: [(speakerID: String, embedding: [Float], weight: Float)]
+    ) -> [String: [Float]] {
+        var sums: [String: [Float]] = [:]
+        var totals: [String: Float] = [:]
+        for sample in samples {
+            let dim = sample.embedding.count
+            if sums[sample.speakerID] == nil {
+                sums[sample.speakerID] = [Float](repeating: 0, count: dim)
+            }
+            guard sums[sample.speakerID]?.count == dim else { continue }
+            for i in 0..<dim {
+                sums[sample.speakerID]![i] += sample.embedding[i] * sample.weight
+            }
+            totals[sample.speakerID, default: 0] += sample.weight
+        }
+        var out: [String: [Float]] = [:]
+        for (speakerID, sum) in sums {
+            guard let total = totals[speakerID], total > 0 else { continue }
+            var mean = sum.map { $0 / total }
+            // L2-normalize so cosine sim against incoming embeddings is a
+            // straight dot product — same convention used by the diarizer's
+            // reference embeddings elsewhere in this service.
+            var sumSq: Float = 0
+            for v in mean { sumSq += v * v }
+            if sumSq > 0 {
+                let scale = 1.0 / sqrtf(sumSq)
+                for i in 0..<mean.count { mean[i] *= scale }
+            }
+            out[speakerID] = mean
+        }
+        return out
+    }
+
+
     /// Cosine similarity over already-L2-normalized vectors == dot product.
     /// Returns 0 when shapes don't match — safer than crashing on partial
     /// pipeline output.
@@ -957,6 +1224,9 @@ final class TranscriptionService {
             contextSegmentID: segment.id
         )
         try? modelContext.save()
+        if markEdited {
+            scheduleAutoRecompute(in: project)
+        }
         return true
     }
 
@@ -1134,7 +1404,13 @@ final class TranscriptionService {
             in: project,
             contextSegmentID: neighbor.id
         )
+        // Both segments' word lists changed; flag them for the auto-
+        // recompute pass to refresh the alignment.
+        segment.wasEdited = true
+        neighbor.wasEdited = true
         try? modelContext.save()
+        recomputeSpeakerCentroids(in: project)
+        scheduleAutoRecompute(in: project)
         return true
     }
 
@@ -1174,22 +1450,195 @@ final class TranscriptionService {
         project.segments.contains(where: { $0.wasEdited })
     }
 
-    /// Re-extracts each edited segment's audio range, re-runs the speech
-    /// recognizer on it, and rewrites the segment's word timings against
-    /// the freshly aligned output. The user's edited *text* is authoritative
-    /// — when the recognizer's transcript differs (because we re-typed it),
-    /// LCS picks the matched words and interpolates the rest.
+    // MARK: - Auto-recompute scheduling (Option A)
+
+    /// Debounced background recompute trigger. Called after every edit
+    /// that affects word boundaries (text edit, split, merge, word move).
+    /// A burst of edits collapses into a single recompute pass at the end
+    /// of the debounce window — that's what makes the playback timings
+    /// "self-heal" without the user clicking the badge or button.
+    ///
+    /// Failure is silent: the manual button + the floating badge stay
+    /// available as fallbacks. The whole point of A is for the *common*
+    /// case to just work; if it can't (audio missing, recognizer fails),
+    /// the explicit affordances pick up the slack.
+    func scheduleAutoRecompute(in project: TranscriptionProject) {
+        let projectID = project.id
+        pendingAutoRecompute[projectID]?.cancel()
+        pendingAutoRecompute[projectID] = Task { @MainActor [weak self] in
+            // 800 ms is long enough to coalesce a typing flurry into one
+            // pass, short enough that the highlight refreshes before the
+            // user has scrolled away mentally.
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            guard !Task.isCancelled else { return }
+            guard let self else { return }
+            guard let project = self.fetchProject(projectID) else { return }
+            do {
+                try await self.recomputeTimings(for: project)
+            } catch {
+                // Silent — the user can still trigger via the manual paths.
+            }
+            self.pendingAutoRecompute.removeValue(forKey: projectID)
+        }
+    }
+
+    // MARK: - Drift detection on segment activation (Option B)
+
+    /// Called by the editor whenever the active playback segment changes.
+    /// Schedules an auto-recompute on the new segment when it looks like
+    /// the timings might be stale or interpolated:
+    ///   * `wasEdited == true` — text edits queued a recompute that
+    ///     hasn't landed yet (or never got scheduled).
+    ///   * `lastTimingsRecomputeAt == nil` AND the segment's word-duration
+    ///     distribution is pathological — the original pipeline output
+    ///     left this segment with timings that read as visually drifty.
+    /// Otherwise no-op. Cheap to call on every segment change because the
+    /// underlying recompute is debounced.
+    func scheduleDriftRecomputeIfNeeded(
+        for segment: SpeakerSegment,
+        in project: TranscriptionProject
+    ) {
+        guard !segment.words.isEmpty else { return }
+        if segment.wasEdited {
+            scheduleAutoRecompute(in: project)
+            return
+        }
+        if segment.lastTimingsRecomputeAt == nil,
+           Self.timingsLookSuspect(segment.words, segmentStart: segment.startSeconds, segmentEnd: segment.endSeconds) {
+            // Mark wasEdited so recomputeTimings (default scope) picks it
+            // up. Cleared when the recompute lands.
+            segment.wasEdited = true
+            try? modelContext.save()
+            scheduleAutoRecompute(in: project)
+        }
+    }
+
+    /// Heuristic: are this segment's word timings shaped like something
+    /// that came out of an interpolation rather than a real ASR pass?
+    /// Conservative on purpose — false positives mean a needless recompute,
+    /// which is a few seconds of background work on real audio. False
+    /// negatives mean playback stays drifty until the user notices and
+    /// hits the manual button.
+    nonisolated private static func timingsLookSuspect(
+        _ words: [WordTiming],
+        segmentStart: TimeInterval,
+        segmentEnd: TimeInterval
+    ) -> Bool {
+        guard words.count >= 4 else { return false }
+        // Word duration sanity: real ASR almost never produces durations
+        // shorter than ~30 ms. A run of <30 ms words usually means
+        // interpolated timings packed into a tight window between sparse
+        // matched anchors.
+        let veryShort = words.filter { ($0.end - $0.start) < 0.03 }.count
+        if Double(veryShort) / Double(words.count) > 0.40 { return true }
+
+        // Boundary sanity: if the last word's end is significantly past
+        // the segment's recorded end, the alignment math is broken.
+        if let last = words.last, last.end > segmentEnd + 0.5 { return true }
+        if let first = words.first, first.start < segmentStart - 0.5 { return true }
+
+        return false
+    }
+
+    // MARK: - Idle-time background healer (Option C, opt-in)
+
+    /// Toggle the always-on idle-time recompute pass. When enabled, a
+    /// long-lived task walks the project store and re-aligns the oldest-
+    /// validated segments one at a time, with sleeps between so it never
+    /// competes with active user work. Off by default; the user opts in
+    /// from the "Word Timings" pane in Preferences.
+    func setBackgroundHealingEnabled(_ enabled: Bool) {
+        if enabled {
+            guard backgroundHealer == nil else { return }
+            backgroundHealer = Task { @MainActor [weak self] in
+                await self?.runBackgroundHealerLoop()
+            }
+        } else {
+            backgroundHealer?.cancel()
+            backgroundHealer = nil
+        }
+    }
+
+    /// The healer's main loop. Picks one stale segment per pass, processes
+    /// it, sleeps. The 60-second sleep between segments is intentional:
+    /// it keeps the heat budget effectively zero on idle machines, and
+    /// even a 1000-segment project gets fully validated in under a day
+    /// of background time. Pauses entirely when any active job (initial
+    /// transcription or user-triggered recompute) is in flight.
+    private func runBackgroundHealerLoop() async {
+        while !Task.isCancelled {
+            // Sleep first so cancellation is responsive on toggle-off.
+            try? await Task.sleep(nanoseconds: 60_000_000_000)
+            guard !Task.isCancelled else { return }
+
+            // Defer if any active user work is running — don't compete.
+            let hasActiveJob = jobs.values.contains(where: {
+                $0.phase != .finished && $0.phase != .failed
+            })
+            if hasActiveJob { continue }
+            if !pendingAutoRecompute.isEmpty { continue }
+
+            // Pick the oldest-validated segment across all projects. Nil
+            // `lastTimingsRecomputeAt` sorts first so never-validated
+            // segments get attention before stale-but-validated ones.
+            guard let target = oldestStaleSegment() else { continue }
+            guard let project = target.project else { continue }
+            target.wasEdited = true
+            try? modelContext.save()
+            do {
+                try await recomputeTimings(for: project)
+            } catch {
+                // Silent — try again next loop iteration on a different segment.
+            }
+        }
+    }
+
+    /// Finds the single most-stale segment in the model store: never-
+    /// validated segments first, then the longest-since-validated one.
+    /// `nil` when nothing exists or every segment is fresh.
+    private func oldestStaleSegment() -> SpeakerSegment? {
+        let descriptor = FetchDescriptor<SpeakerSegment>()
+        guard let allSegments = try? modelContext.fetch(descriptor) else { return nil }
+        // Skip empty-word segments (legacy / cleared) — recompute can't
+        // help when there's nothing to align.
+        let candidates = allSegments.filter { !$0.words.isEmpty }
+        guard !candidates.isEmpty else { return nil }
+        return candidates.min { lhs, rhs in
+            switch (lhs.lastTimingsRecomputeAt, rhs.lastTimingsRecomputeAt) {
+            case (nil, nil): return false
+            case (nil, _): return true        // nil sorts first
+            case (_, nil): return false
+            case (let l?, let r?): return l < r
+            }
+        }
+    }
+
+    /// Re-extracts each segment's audio range, re-runs the speech recognizer
+    /// on it, and rewrites the segment's word timings against the freshly
+    /// aligned output. The user's segment *text* is authoritative — when
+    /// the recognizer's transcript differs (because we re-typed it), LCS
+    /// picks the matched words and interpolates the rest.
+    ///
+    /// `includeAll` controls scope:
+    ///  * `false` (default) — only segments flagged `wasEdited` get a pass.
+    ///    Keeps the floating "Recompute Timings" badge cheap (it only
+    ///    appears after edits).
+    ///  * `true` — every segment is re-aligned. Used by the manual
+    ///    "Recompute Word Timings" button in Transcription Settings, for
+    ///    when the user feels playback is drifting even though no edits
+    ///    are flagged.
     @MainActor
     func recomputeTimings(
         for project: TranscriptionProject,
         locale: Locale = .current,
+        includeAll: Bool = false,
         onProgress: @escaping (Double) -> Void = { _ in }
     ) async throws {
         guard let audioURL = project.sourceAudioURL else {
             throw TranscriptEditing.RecomputeError.sourceUnavailable
         }
         let editedSegments = project.segments
-            .filter { $0.wasEdited }
+            .filter { includeAll || $0.wasEdited }
             .sorted { $0.startSeconds < $1.startSeconds }
         guard !editedSegments.isEmpty else { return }
 
@@ -1242,6 +1691,7 @@ final class TranscriptionService {
             )
             segment.words = aligned
             segment.wasEdited = false
+            segment.lastTimingsRecomputeAt = .now
             try? modelContext.save()
         }
         onProgress(1.0)
@@ -1502,6 +1952,14 @@ final class TranscriptionService {
                 in: project
             )
         }
+        // Persist the diarizer's per-speaker centroids so the editor can
+        // surface relabel suggestions from this point forward. Filter to the
+        // speaker IDs that actually survived the run — any stale centroids
+        // from a pre-retranscribe state would point at speakers that no
+        // longer exist. Retranscribe also drops dismissed relabel hints
+        // since the segment IDs are about to be regenerated.
+        project.speakerCentroids = speakerCentroids.filter { speakerIDs.contains($0.key) }
+        project.dismissedRelabelSuggestions = []
         project.status = .ready
         try? modelContext.save()
         updateJob(projectID) { $0.phase = .finished }

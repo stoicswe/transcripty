@@ -46,6 +46,30 @@ final class TranscriptionProject {
     /// downsampled to whatever count the current view needs. `nil` means
     /// not yet computed.
     var cachedPeaks: [Float]?
+    /// Per-speaker mean voice-print embedding (256-D WeSpeaker space),
+    /// keyed by speakerID. Maintained as the user edits — splits/merges/
+    /// retranscribes/relabels all kick a background recompute that
+    /// re-averages from the current segment embeddings. Empty for legacy
+    /// projects until the next edit triggers a recompute. Used by the
+    /// editor to surface "this segment sounds more like another speaker"
+    /// suggestions (cosine similarity vs. centroids).
+    var speakerCentroids: [String: [Float]] = [:]
+    /// Segments where the user has explicitly dismissed a relabel
+    /// suggestion ("no, that one really IS Speaker A even though it sounds
+    /// like Speaker B"). Two effects:
+    ///   1. We don't surface the suggestion again — the user already
+    ///      decided.
+    ///   2. The next centroid recompute weights these segments 2× toward
+    ///      their currently-assigned speaker, pulling the centroid toward
+    ///      the user's confirmed example. Closes the feedback loop the
+    ///      user described — both accepts and dismisses are training
+    ///      signal.
+    var dismissedRelabelSuggestions: [UUID] = []
+    /// Segments where the user has either run mid-segment speaker-change
+    /// detection (regardless of result) or dismissed the "may contain
+    /// multiple speakers" flag. Suppresses the flag from re-appearing on
+    /// the same segment until it's edited (which gives it a new ID).
+    var checkedMixedSpeakerSegments: [UUID] = []
 
     @Relationship(deleteRule: .cascade, inverse: \SpeakerSegment.project)
     var segments: [SpeakerSegment] = []
@@ -121,6 +145,13 @@ final class SpeakerSegment {
     /// any inserted/changed words carry interpolated timings that the editor
     /// surfaces via a "Recompute Timings" affordance.
     var wasEdited: Bool = false
+    /// Timestamp of the last successful forced-alignment pass that wrote
+    /// this segment's word timings. `nil` for segments whose timings come
+    /// straight out of the original transcription pipeline (never re-
+    /// validated). Used by the playback drift detector to decide whether
+    /// to schedule a background recompute, and by the optional idle-time
+    /// healer to pick up the oldest-validated segments first.
+    var lastTimingsRecomputeAt: Date?
     var project: TranscriptionProject?
 
     init(startSeconds: Double,

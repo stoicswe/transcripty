@@ -6,10 +6,60 @@ struct SettingsView: View {
         TabView {
             AboutSettings()
                 .tabItem { Label("About", systemImage: "info.circle") }
+            WordTimingsSettings()
+                .tabItem { Label("Word Timings", systemImage: "waveform.path.badge.plus") }
             StorageSettings()
                 .tabItem { Label("Storage", systemImage: "internaldrive") }
         }
         .frame(width: 480, height: 340)
+    }
+}
+
+/// Preferences for the always-on idle-time word-timing healer (Option C).
+/// The toggle is observed by `TranscriptyApp`, which wires it into the
+/// `TranscriptionService.setBackgroundHealingEnabled(_:)` method —
+/// flipping it on starts a long-lived background task that walks the
+/// project store and re-aligns the oldest-validated segments first; off
+/// cancels the task. Default is off so users opt in deliberately.
+private struct WordTimingsSettings: View {
+    @Environment(TranscriptionService.self) private var service
+    @AppStorage("editor.backgroundTimingHealing") private var backgroundHealing: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Word Timing Self-Healing")
+                .font(.headline)
+
+            Toggle(isOn: $backgroundHealing) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Continuously refine word timings in the background")
+                        .font(.subheadline.weight(.semibold))
+                    Text("When idle, Transcripty re-runs forced alignment on the oldest-validated segments across all projects, one at a time, so playback highlighting stays in sync with the audio. Pauses automatically while transcription or a manual recompute is running. Off by default.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .toggleStyle(.switch)
+            .onChange(of: backgroundHealing) { _, enabled in
+                service.setBackgroundHealingEnabled(enabled)
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("How auto-alignment works")
+                    .font(.subheadline.weight(.semibold))
+                Text("Word timings always update automatically after edits, splits, merges, and word moves — no toggle required. Playback also re-validates segments as you reach them. The setting above is for the slower, deeper pass that runs when nothing else is going on.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer()
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 }
 

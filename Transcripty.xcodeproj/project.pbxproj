@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		08672B8E0B7B7DB79EB2BD61 /* ProjectsGridView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1E502611891C77DC5A2964C9 /* ProjectsGridView.swift */; };
 		095E8A9AEFACDD8B54B4490C /* TranscriptEditing.swift in Sources */ = {isa = PBXBuildFile; fileRef = 63B590B3E484013BFB4101C4 /* TranscriptEditing.swift */; };
+		0A2AECFEDEE74FBE5BF90E9E /* SpeakerVoicePrintService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3C5C2EBECC17B914B0E4C32 /* SpeakerVoicePrintService.swift */; };
 		154C157E3968ACD1D7FDA8F4 /* EntityScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = C626B69FB01EEABBF56066A4 /* EntityScanner.swift */; };
 		17E89324FBDFB7B417DBA766 /* LabelEditorSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8620A154E5BE17E9C48C516 /* LabelEditorSheet.swift */; };
 		1B472D38D1A667352247A27B /* WaveformThumbnail.swift in Sources */ = {isa = PBXBuildFile; fileRef = 343BD287B1D3BCB700521D99 /* WaveformThumbnail.swift */; };
@@ -72,6 +73,7 @@
 		AAE8E2B6F71363778D55D31D /* EditorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorView.swift; sourceTree = "<group>"; };
 		B27C696CCFD61F5C86F26C9C /* TranscriptyApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscriptyApp.swift; sourceTree = "<group>"; };
 		BE5D8D0691EC6C6034EE832E /* ProjectWaveformCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectWaveformCache.swift; sourceTree = "<group>"; };
+		C3C5C2EBECC17B914B0E4C32 /* SpeakerVoicePrintService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeakerVoicePrintService.swift; sourceTree = "<group>"; };
 		C5EEF82157EBD3B3BDDB9E84 /* ZipArchive.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZipArchive.swift; sourceTree = "<group>"; };
 		C626B69FB01EEABBF56066A4 /* EntityScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EntityScanner.swift; sourceTree = "<group>"; };
 		CE0F6B692F1C189B32B38B48 /* PrivacyView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivacyView.swift; sourceTree = "<group>"; };
@@ -220,6 +222,7 @@
 		7B4747ED6E081C383CAF28BD /* Services */ = {
 			isa = PBXGroup;
 			children = (
+				C3C5C2EBECC17B914B0E4C32 /* SpeakerVoicePrintService.swift */,
 				63B590B3E484013BFB4101C4 /* TranscriptEditing.swift */,
 				67BFDA3A0855A29497BE186F /* TranscriptionService.swift */,
 				0D6420D9565DB5EC4404EED8 /* TranscriptTextImporter.swift */,
@@ -417,6 +420,7 @@
 				08672B8E0B7B7DB79EB2BD61 /* ProjectsGridView.swift in Sources */,
 				488CE83A9E289EA9907143B4 /* RootView.swift in Sources */,
 				A46E36F4DF9622FF6D6F3889 /* SettingsView.swift in Sources */,
+				0A2AECFEDEE74FBE5BF90E9E /* SpeakerVoicePrintService.swift in Sources */,
 				A23DDC1071BD72AA5A51E538 /* Transcriber.swift in Sources */,
 				095E8A9AEFACDD8B54B4490C /* TranscriptEditing.swift in Sources */,
 				3CF03ADB081A2B2B3EFD6F90 /* TranscriptTextImporter.swift in Sources */,
