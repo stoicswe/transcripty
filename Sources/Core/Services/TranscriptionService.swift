@@ -28,6 +28,7 @@ final class TranscriptionService {
 
     private let pipeline: TranscriptionPipeline
     private let modelContext: ModelContext
+    private let verifier: AlignmentVerificationService
     private var tasks: [UUID: Task<Void, Never>] = [:]
     /// Per-project debounced auto-recompute task. A flurry of edits within
     /// the debounce window collapses into one recompute pass at the end.
@@ -40,10 +41,12 @@ final class TranscriptionService {
     init(
         modelContext: ModelContext,
         transcriber: any Transcriber = AppleSpeechTranscriber(),
-        diarizer: any Diarizer = FluidAudioDiarizer()
+        diarizer: any Diarizer = FluidAudioDiarizer(),
+        verifier: AlignmentVerificationService = AlignmentVerificationService()
     ) {
         self.modelContext = modelContext
         self.pipeline = TranscriptionPipeline(transcriber: transcriber, diarizer: diarizer)
+        self.verifier = verifier
     }
 
     func start(project: TranscriptionProject, locale: Locale = .current) {
@@ -209,6 +212,7 @@ final class TranscriptionService {
         atWordIndex wordIndex: Int,
         in project: TranscriptionProject
     ) -> SpeakerSegment? {
+        guard !segment.isNonSpeech else { return nil }
         guard wordIndex > 0, wordIndex < segment.words.count else { return nil }
 
         let firstWords = Array(segment.words.prefix(wordIndex))
@@ -281,13 +285,14 @@ final class TranscriptionService {
             summary: "Split into \(project.displayName(forSpeakerID: newSpeakerID))",
             in: project
         )
-        // Both halves cross a boundary the original alignment didn't know
-        // about, so flag them for the auto-recompute pass to refresh.
-        segment.wasEdited = true
-        newSegment.wasEdited = true
+        // No auto-recompute on split: both halves preserve their original
+        // ASR-produced word timings (already in project-absolute time).
+        // The split only redraws segment boundaries, it doesn't change
+        // when individual words are spoken — running ASR again on a short
+        // post-split slice produces *worse* timings than the originals
+        // because Apple's recognizer is unreliable on very short audio.
         try? modelContext.save()
         recomputeSpeakerCentroids(in: project)
-        scheduleAutoRecompute(in: project)
         return newSegment
     }
 
@@ -307,6 +312,9 @@ final class TranscriptionService {
         in project: TranscriptionProject
     ) -> SpeakerSegment? {
         guard a.id != b.id else { return nil }
+        // Music / silence blocks never merge with speech turns — that
+        // would smear word timings back across the gap we just isolated.
+        guard !a.isNonSpeech, !b.isNonSpeech else { return nil }
         guard project.segments.contains(where: { $0.id == a.id }),
               project.segments.contains(where: { $0.id == b.id }) else { return nil }
 
@@ -357,12 +365,12 @@ final class TranscriptionService {
             in: project,
             contextSegmentID: first.id
         )
-        // The survivor's word boundaries now span both turns; flag so the
-        // auto-recompute pass refreshes the alignment.
-        first.wasEdited = true
+        // No auto-recompute on merge: words from both halves carry their
+        // original ASR-produced project-time timings, and concatenating
+        // the lists preserves them. Re-running ASR on the merged span
+        // would be redundant at best and risk worse alignment at worst.
         try? modelContext.save()
         recomputeSpeakerCentroids(in: project)
-        scheduleAutoRecompute(in: project)
         return first
     }
 
@@ -494,6 +502,103 @@ final class TranscriptionService {
         recomputeSpeakerCentroids(in: project)
     }
 
+    /// Restores `segment.words` to the snapshot the verifier captured the
+    /// first time it ran on this segment — useful when a recompute pass
+    /// produced worse alignment than the original recognizer output. The
+    /// snapshot itself is left in place so the user can restore again
+    /// after a future bad recompute. No-op when no snapshot exists yet.
+    @discardableResult
+    func restoreOriginalWordTimings(
+        for segment: SpeakerSegment,
+        in project: TranscriptionProject
+    ) -> Bool {
+        guard let original = segment.originalWords, !original.isEmpty else { return false }
+        let previousWords = segment.words
+        let previousWasEdited = segment.wasEdited
+        segment.words = original
+        segment.wasEdited = false
+        segment.lastTimingsRecomputeAt = nil
+        recordEdit(
+            .textChanged(
+                segmentID: segment.id,
+                previousText: segment.text,
+                previousWords: previousWords,
+                previousWasEdited: previousWasEdited
+            ),
+            summary: "Restored original word timings",
+            in: project,
+            contextSegmentID: segment.id
+        )
+        try? modelContext.save()
+        return true
+    }
+
+    // MARK: - Non-speech (music / long silence) blocks
+
+    /// Marker text used by every non-speech segment. The editor renders
+    /// these rows with an animated music-note view rather than the text,
+    /// so the literal value is mostly load-bearing for the plain-text
+    /// export path; using a recognizable bracket-marker keeps exports
+    /// readable.
+    static let nonSpeechMarker: String = "[MUSIC]"
+
+    /// Default minimum gap length (in seconds) before a non-speech stretch
+    /// gets its own block. Three seconds is long enough that the diarizer
+    /// would never have called it part of one speaker turn anyway, and
+    /// short enough to catch typical interludes like intros or stingers.
+    /// Anything shorter is a normal between-speaker pause and stays
+    /// implicit in the segment boundary.
+    static let nonSpeechGapThresholdSeconds: TimeInterval = 3.0
+
+    /// Inserts a non-speech ("[MUSIC]") block for every gap between
+    /// chronologically-adjacent speech segments that exceeds
+    /// `gapThreshold`. Idempotent: a gap already filled by an existing
+    /// non-speech segment is skipped, so the same project can be
+    /// re-detected without producing duplicates.
+    ///
+    /// We don't trim adjacent speech segments here — their existing word
+    /// timings are usually accurate, and shrinking the segment bounds
+    /// would risk dropping legitimate trailing/leading speech. The block
+    /// itself is enough to fix the user-visible "click first word after
+    /// music, audio is mis-anchored" symptom because the post-music
+    /// segment's `startSeconds` is preserved while the prior segment's
+    /// trailing silence/music stops being considered part of *that* turn.
+    @discardableResult
+    func detectAndInsertNonSpeechBlocks(
+        in project: TranscriptionProject,
+        gapThreshold: TimeInterval = TranscriptionService.nonSpeechGapThresholdSeconds
+    ) -> Int {
+        let ordered = project.segments.sorted { $0.startSeconds < $1.startSeconds }
+        guard ordered.count >= 2 else { return 0 }
+        var inserted = 0
+        for index in 0..<(ordered.count - 1) {
+            let earlier = ordered[index]
+            let later = ordered[index + 1]
+            // Skip if either bookend is itself non-speech — the gap is
+            // already accounted for by the existing non-speech row.
+            if earlier.isNonSpeech || later.isNonSpeech { continue }
+            let gapStart = earlier.endSeconds
+            let gapEnd = later.startSeconds
+            let gap = gapEnd - gapStart
+            guard gap >= gapThreshold else { continue }
+            let block = SpeakerSegment(
+                startSeconds: gapStart,
+                endSeconds: gapEnd,
+                speakerID: "_nonspeech",
+                speakerName: "",
+                text: Self.nonSpeechMarker
+            )
+            block.isNonSpeech = true
+            block.project = project
+            modelContext.insert(block)
+            inserted += 1
+        }
+        if inserted > 0 {
+            try? modelContext.save()
+        }
+        return inserted
+    }
+
     /// Suppresses the "may contain multiple speakers" flag for a segment.
     /// Called both when the user dismisses the flag without running
     /// detection ("don't ask again") and after a successful detection
@@ -554,7 +659,11 @@ final class TranscriptionService {
         in project: TranscriptionProject
     ) -> String? {
         let parentSpeakerID = parent.speakerID
-        let allSegments = project.segments.sorted { $0.startSeconds < $1.startSeconds }
+        // Non-speech rows aren't valid candidates — their `_nonspeech`
+        // speakerID would otherwise leak into the suggestion ranking.
+        let allSegments = project.segments
+            .filter { !$0.isNonSpeech }
+            .sorted { $0.startSeconds < $1.startSeconds }
         let candidateIDs = Set(allSegments.map(\.speakerID)).subtracting([parentSpeakerID])
         guard !candidateIDs.isEmpty else { return nil }
         if candidateIDs.count == 1 { return candidateIDs.first }
@@ -1178,8 +1287,14 @@ final class TranscriptionService {
         to segment: SpeakerSegment,
         newText: String,
         in project: TranscriptionProject,
-        markEdited: Bool = true
+        markEdited: Bool = true,
+        // Internal escape hatch: explicit non-speech edits would corrupt
+        // the [MUSIC] marker and break the row's visual treatment.
+        // The editor never invokes the text-editor on these rows, but the
+        // guard makes the contract explicit at the service boundary.
+        _ allowNonSpeech: Bool = false
     ) -> Bool {
+        if segment.isNonSpeech, !allowNonSpeech { return false }
         let trimmed = newText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed != segment.text else { return false }
         let newTokens = TranscriptEditing.tokenize(trimmed)
@@ -1314,6 +1429,7 @@ final class TranscriptionService {
         direction: MergeDirection,
         in project: TranscriptionProject
     ) -> Bool {
+        guard !segment.isNonSpeech else { return false }
         guard !wordRange.isEmpty,
               wordRange.lowerBound >= 0,
               wordRange.upperBound <= segment.words.count else { return false }
@@ -1404,13 +1520,12 @@ final class TranscriptionService {
             in: project,
             contextSegmentID: neighbor.id
         )
-        // Both segments' word lists changed; flag them for the auto-
-        // recompute pass to refresh the alignment.
-        segment.wasEdited = true
-        neighbor.wasEdited = true
+        // No auto-recompute on word-move: the moved words carry their
+        // original project-time timings and the destination segment just
+        // appends them — re-running ASR on the new boundary would risk
+        // overwriting good timings with worse ones.
         try? modelContext.save()
         recomputeSpeakerCentroids(in: project)
-        scheduleAutoRecompute(in: project)
         return true
     }
 
@@ -1485,59 +1600,29 @@ final class TranscriptionService {
     // MARK: - Drift detection on segment activation (Option B)
 
     /// Called by the editor whenever the active playback segment changes.
-    /// Schedules an auto-recompute on the new segment when it looks like
-    /// the timings might be stale or interpolated:
-    ///   * `wasEdited == true` — text edits queued a recompute that
-    ///     hasn't landed yet (or never got scheduled).
-    ///   * `lastTimingsRecomputeAt == nil` AND the segment's word-duration
-    ///     distribution is pathological — the original pipeline output
-    ///     left this segment with timings that read as visually drifty.
-    /// Otherwise no-op. Cheap to call on every segment change because the
-    /// underlying recompute is debounced.
+    /// Schedules an auto-recompute only when the segment is *already*
+    /// flagged `wasEdited` — i.e. a text edit set the flag and the
+    /// debounced auto-recompute either hasn't run yet or got dropped.
+    /// This is purely a safety net; the primary auto-recompute trigger
+    /// is the text-edit hook itself.
+    ///
+    /// We deliberately do NOT use a pathology heuristic to second-guess
+    /// the recognizer's original timings here. Earlier versions of this
+    /// method tried to guess whether word-duration distributions "looked
+    /// suspect" and proactively rescheduled recomputes — which caused
+    /// timings to silently shift under the user as they clicked around
+    /// the transcript. Real ASR produces short-duration words for
+    /// fillers all the time; that's not a defect to fix automatically.
+    /// The user has explicit affordances ("Recompute Word Timings",
+    /// "Restore Original Word Timings") for the genuinely-broken cases.
     func scheduleDriftRecomputeIfNeeded(
         for segment: SpeakerSegment,
         in project: TranscriptionProject
     ) {
+        guard !segment.isNonSpeech else { return }
         guard !segment.words.isEmpty else { return }
-        if segment.wasEdited {
-            scheduleAutoRecompute(in: project)
-            return
-        }
-        if segment.lastTimingsRecomputeAt == nil,
-           Self.timingsLookSuspect(segment.words, segmentStart: segment.startSeconds, segmentEnd: segment.endSeconds) {
-            // Mark wasEdited so recomputeTimings (default scope) picks it
-            // up. Cleared when the recompute lands.
-            segment.wasEdited = true
-            try? modelContext.save()
-            scheduleAutoRecompute(in: project)
-        }
-    }
-
-    /// Heuristic: are this segment's word timings shaped like something
-    /// that came out of an interpolation rather than a real ASR pass?
-    /// Conservative on purpose — false positives mean a needless recompute,
-    /// which is a few seconds of background work on real audio. False
-    /// negatives mean playback stays drifty until the user notices and
-    /// hits the manual button.
-    nonisolated private static func timingsLookSuspect(
-        _ words: [WordTiming],
-        segmentStart: TimeInterval,
-        segmentEnd: TimeInterval
-    ) -> Bool {
-        guard words.count >= 4 else { return false }
-        // Word duration sanity: real ASR almost never produces durations
-        // shorter than ~30 ms. A run of <30 ms words usually means
-        // interpolated timings packed into a tight window between sparse
-        // matched anchors.
-        let veryShort = words.filter { ($0.end - $0.start) < 0.03 }.count
-        if Double(veryShort) / Double(words.count) > 0.40 { return true }
-
-        // Boundary sanity: if the last word's end is significantly past
-        // the segment's recorded end, the alignment math is broken.
-        if let last = words.last, last.end > segmentEnd + 0.5 { return true }
-        if let first = words.first, first.start < segmentStart - 0.5 { return true }
-
-        return false
+        guard segment.wasEdited else { return }
+        scheduleAutoRecompute(in: project)
     }
 
     // MARK: - Idle-time background healer (Option C, opt-in)
@@ -1599,9 +1684,10 @@ final class TranscriptionService {
     private func oldestStaleSegment() -> SpeakerSegment? {
         let descriptor = FetchDescriptor<SpeakerSegment>()
         guard let allSegments = try? modelContext.fetch(descriptor) else { return nil }
-        // Skip empty-word segments (legacy / cleared) — recompute can't
-        // help when there's nothing to align.
-        let candidates = allSegments.filter { !$0.words.isEmpty }
+        // Skip empty-word segments (legacy / cleared) and non-speech
+        // ([MUSIC]) blocks — recompute can't help when there's nothing
+        // to align.
+        let candidates = allSegments.filter { !$0.words.isEmpty && !$0.isNonSpeech }
         guard !candidates.isEmpty else { return nil }
         return candidates.min { lhs, rhs in
             switch (lhs.lastTimingsRecomputeAt, rhs.lastTimingsRecomputeAt) {
@@ -1638,7 +1724,7 @@ final class TranscriptionService {
             throw TranscriptEditing.RecomputeError.sourceUnavailable
         }
         let editedSegments = project.segments
-            .filter { includeAll || $0.wasEdited }
+            .filter { !$0.isNonSpeech && (includeAll || $0.wasEdited) }
             .sorted { $0.startSeconds < $1.startSeconds }
         guard !editedSegments.isEmpty else { return }
 
@@ -1681,83 +1767,30 @@ final class TranscriptionService {
             }
             let recognizedWords = recognized.flatMap(\.words)
 
-            let aligned = align(
+            let aligned = await verifier.verifyTimings(
+                slicedAudioURL: extracted,
+                sliceLeadOffset: extractStart,
                 userTokens: segment.words.map(\.text),
-                userOldWords: segment.words,
                 recognizedWords: recognizedWords,
-                lead: extractStart,
                 segmentStart: segment.startSeconds,
                 segmentEnd: segment.endSeconds
             )
+            guard let aligned else {
+                continue
+            }
+            // First-ever recompute on this segment? Snapshot the original
+            // recognizer-produced word timings before we overwrite, so the
+            // user can roll back per-segment if a verification pass ever
+            // produces worse results.
+            if segment.originalWords == nil {
+                segment.originalWords = segment.words
+            }
             segment.words = aligned
             segment.wasEdited = false
             segment.lastTimingsRecomputeAt = .now
             try? modelContext.save()
         }
         onProgress(1.0)
-    }
-
-    /// Aligns the user's segment tokens against the recognizer's freshly-
-    /// produced word list. Strategy:
-    ///   1. LCS over lowercased text.
-    ///   2. Matched user tokens take the recognizer's timings (offset back
-    ///      into the project's timeline).
-    ///   3. Unmatched user tokens get interpolated between matched anchors,
-    ///      falling back to segment bounds at the edges.
-    private func align(
-        userTokens: [String],
-        userOldWords: [WordTiming],
-        recognizedWords: [WordTiming],
-        lead: TimeInterval,
-        segmentStart: TimeInterval,
-        segmentEnd: TimeInterval
-    ) -> [WordTiming] {
-        guard !userTokens.isEmpty else { return [] }
-        // Recognizer timings are relative to the extracted clip's t=0; shift
-        // them back into the project's absolute timeline so they line up
-        // with the editor's playback.
-        let absoluteRecognized = recognizedWords.map { word in
-            WordTiming(
-                start: lead + word.start,
-                end: lead + word.end,
-                text: word.text
-            )
-        }
-
-        let userLower = userTokens.map { $0.lowercased() }
-        let recogLower = absoluteRecognized.map { stripPunctuation($0.text.lowercased()) }
-        let userClean = userLower.map(stripPunctuation)
-
-        let matches = TranscriptEditing.lcsMatches(old: recogLower, new: userClean)
-        var slots: [WordTiming?] = Array(repeating: nil, count: userTokens.count)
-        for (recogIdx, userIdx) in matches {
-            let r = absoluteRecognized[recogIdx]
-            slots[userIdx] = WordTiming(start: r.start, end: r.end, text: userTokens[userIdx])
-        }
-
-        var i = 0
-        while i < slots.count {
-            if slots[i] != nil { i += 1; continue }
-            var j = i
-            while j < slots.count, slots[j] == nil { j += 1 }
-            let lead: TimeInterval = (i > 0) ? (slots[i - 1]?.end ?? segmentStart) : segmentStart
-            let trail: TimeInterval = (j < slots.count) ? (slots[j]?.start ?? segmentEnd) : segmentEnd
-            let span = max(0.05, trail - lead)
-            let runCount = j - i
-            let perWord = span / Double(runCount)
-            for k in 0..<runCount {
-                let s = lead + perWord * Double(k)
-                let e = lead + perWord * Double(k + 1)
-                slots[i + k] = WordTiming(start: s, end: e, text: userTokens[i + k])
-            }
-            i = j
-        }
-        return slots.compactMap { $0 }
-    }
-
-    private func stripPunctuation(_ s: String) -> String {
-        s.unicodeScalars.filter { !CharacterSet.punctuationCharacters.contains($0) }
-            .reduce(into: "") { $0.append(Character($1)) }
     }
 
     // MARK: - Project archive
@@ -1962,6 +1995,11 @@ final class TranscriptionService {
         project.dismissedRelabelSuggestions = []
         project.status = .ready
         try? modelContext.save()
+        // Once segments are persisted, scan for long non-speech gaps
+        // (typically music interludes) and drop a [MUSIC] block in each.
+        // This anchors the post-gap speech segment's timings against
+        // the actual speech edge instead of bleeding across the gap.
+        detectAndInsertNonSpeechBlocks(in: project)
         updateJob(projectID) { $0.phase = .finished }
         tasks.removeValue(forKey: projectID)
     }

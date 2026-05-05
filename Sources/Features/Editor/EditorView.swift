@@ -266,6 +266,10 @@ struct EditorView: View {
                 onRecomputeTimings: {
                     isShowingSettings = false
                     runRecomputeTimings(forceAll: true)
+                },
+                onDetectMusicBreaks: {
+                    isShowingSettings = false
+                    service.detectAndInsertNonSpeechBlocks(in: project)
                 }
             )
         }
@@ -379,7 +383,7 @@ struct EditorView: View {
         hasRunInitialEntityScan = true
         // Snapshot id+text on the main actor so the background task only
         // sees Sendable values — SwiftData @Model types aren't crossable.
-        let samples = orderedSegments.map { EntityScanner.SegmentSample(id: $0.id, text: $0.text) }
+        let samples = orderedSegments.filter { !$0.isNonSpeech }.map { EntityScanner.SegmentSample(id: $0.id, text: $0.text) }
         Task.detached(priority: .utility) {
             let groups = EntityScanner.scan(samples: samples)
             await MainActor.run {
@@ -397,7 +401,7 @@ struct EditorView: View {
     private func runEntityScan() {
         guard !isScanningEntities else { return }
         isScanningEntities = true
-        let samples = orderedSegments.map { EntityScanner.SegmentSample(id: $0.id, text: $0.text) }
+        let samples = orderedSegments.filter { !$0.isNonSpeech }.map { EntityScanner.SegmentSample(id: $0.id, text: $0.text) }
         Task.detached(priority: .userInitiated) {
             let groups = EntityScanner.scan(samples: samples)
             await MainActor.run {
@@ -451,7 +455,7 @@ struct EditorView: View {
         // entity grouping and the find-bar match index against the new state.
         // The grouping refresh is fire-and-forget on a background task so a
         // long transcript doesn't briefly stall the main thread post-apply.
-        let samples = orderedSegments.map { EntityScanner.SegmentSample(id: $0.id, text: $0.text) }
+        let samples = orderedSegments.filter { !$0.isNonSpeech }.map { EntityScanner.SegmentSample(id: $0.id, text: $0.text) }
         Task.detached(priority: .utility) {
             let groups = EntityScanner.scan(samples: samples)
             await MainActor.run { self.entityGroups = groups }
@@ -498,7 +502,7 @@ struct EditorView: View {
         }
         let options: String.CompareOptions = findCaseSensitive ? [] : [.caseInsensitive]
         var matches: [FindMatch] = []
-        for segment in orderedSegments {
+        for segment in orderedSegments where !segment.isNonSpeech {
             var searchRange = segment.text.startIndex..<segment.text.endIndex
             while let range = segment.text.range(of: findQuery, options: options, range: searchRange) {
                 matches.append(FindMatch(segmentID: segment.id, range: range))
@@ -703,6 +707,7 @@ private struct TranscriptionSettingsSheet: View {
     let onClearTranscript: () -> Void
     let onRetranscribe: (_ speakerCount: Int?, _ useLabels: Bool) -> Void
     let onRecomputeTimings: () -> Void
+    let onDetectMusicBreaks: () -> Void
 
     @State private var speakerCountSelection: Int?
     @State private var useLabels: Bool
@@ -716,7 +721,8 @@ private struct TranscriptionSettingsSheet: View {
         onCancel: @escaping () -> Void,
         onClearTranscript: @escaping () -> Void,
         onRetranscribe: @escaping (_ speakerCount: Int?, _ useLabels: Bool) -> Void,
-        onRecomputeTimings: @escaping () -> Void
+        onRecomputeTimings: @escaping () -> Void,
+        onDetectMusicBreaks: @escaping () -> Void
     ) {
         self.project = project
         self.hasNamedSpeakers = hasNamedSpeakers
@@ -726,6 +732,7 @@ private struct TranscriptionSettingsSheet: View {
         self.onClearTranscript = onClearTranscript
         self.onRetranscribe = onRetranscribe
         self.onRecomputeTimings = onRecomputeTimings
+        self.onDetectMusicBreaks = onDetectMusicBreaks
         _speakerCountSelection = State(initialValue: project.expectedSpeakerCount)
         _useLabels = State(initialValue: hasNamedSpeakers)
     }
@@ -751,6 +758,8 @@ private struct TranscriptionSettingsSheet: View {
             if hasTranscript {
                 Divider()
                 wordTimingSection
+                Divider()
+                musicBreaksSection
                 Divider()
                 clearSection
             }
@@ -817,6 +826,30 @@ private struct TranscriptionSettingsSheet: View {
                 }
             }
             .toggleStyle(.switch)
+        }
+    }
+
+    /// Re-runs music-gap detection on demand. The pipeline runs this
+    /// automatically once at the end of initial transcription, but if
+    /// the user merges/splits/moves around segments the gap topology
+    /// changes — letting them re-detect catches new music interludes
+    /// without forcing a full re-transcribe. Idempotent: existing
+    /// `[MUSIC]` blocks are preserved, new ones added only where new
+    /// gaps now exist.
+    private var musicBreaksSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Music & Silence Breaks")
+                .font(.subheadline.weight(.semibold))
+            Text("Inserts a non-editable [MUSIC] block for any gap longer than three seconds between speech segments. The block anchors playback timings on either side so seeking onto the first word after a music interlude lands on the right syllable.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button {
+                onDetectMusicBreaks()
+            } label: {
+                Label("Detect Music Breaks", systemImage: "music.note.list")
+            }
+            .buttonStyle(.bordered)
         }
     }
 
@@ -997,8 +1030,18 @@ private struct TranscriptListView: View {
                             SegmentRow(
                                 project: project,
                                 segment: segment,
-                                previousSegment: index > 0 ? segments[index - 1] : nil,
-                                nextSegment: index < segments.count - 1 ? segments[index + 1] : nil,
+                                // Neighbor lookup skips over [MUSIC] /
+                                // non-speech rows so "Merge with previous"
+                                // and word-move affordances bridge across
+                                // an interlude to the nearest *speech*
+                                // segment instead of trying to merge into
+                                // a music block.
+                                previousSegment: (0..<index).reversed()
+                                    .first(where: { !segments[$0].isNonSpeech })
+                                    .map { segments[$0] },
+                                nextSegment: ((index + 1)..<segments.count)
+                                    .first(where: { !segments[$0].isNonSpeech })
+                                    .map { segments[$0] },
                                 currentTime: currentTime,
                                 isActive: followAlongEnabled && segment.contains(time: currentTime),
                                 selectionRange: localSelection?.range,
@@ -1378,6 +1421,45 @@ private struct SegmentRow: View {
         isActive ? segment.activeWordIndex(at: currentTime) : nil
     }
 
+    /// Worst (lowest-quality) word-timing grade across the segment's words.
+    /// Drives the small inline indicator next to the timestamp; the editor
+    /// only renders the dot when this is `.approximate` or `.interpolated`
+    /// so a fully-verified segment shows nothing extra.
+    private var aggregateAlignmentQuality: WordTimingQuality {
+        guard !segment.words.isEmpty else { return .unverified }
+        var worst: WordTimingQuality = .verified
+        let order: [WordTimingQuality] = [.verified, .approximate, .unverified, .interpolated]
+        for word in segment.words {
+            if order.firstIndex(of: word.quality) ?? 0 > order.firstIndex(of: worst) ?? 0 {
+                worst = word.quality
+            }
+        }
+        return worst
+    }
+
+    /// Small inline marker next to the timestamp that signals when this
+    /// segment's word timings haven't been (or couldn't be) fully verified.
+    /// Shown only when at least one word is `.interpolated` or
+    /// `.approximate` — fully `.verified` segments and never-recomputed
+    /// segments show nothing, so the indicator stays out of the way.
+    @ViewBuilder
+    private var alignmentQualityDot: some View {
+        switch aggregateAlignmentQuality {
+        case .interpolated:
+            Circle()
+                .fill(.orange.opacity(0.6))
+                .frame(width: 5, height: 5)
+                .help("Some word timings in this segment are interpolated — seeking on those words may drift. Recompute Word Timings (Settings) often fixes this.")
+        case .approximate:
+            Circle()
+                .fill(.yellow.opacity(0.6))
+                .frame(width: 5, height: 5)
+                .help("Word timings here are recognizer-based but not fully corroborated by silence-boundary detection. Seeking is usually accurate but may be off by tens of milliseconds on a few words.")
+        case .verified, .unverified:
+            EmptyView()
+        }
+    }
+
     /// The split candidate (if any) that lands *before* the given word
     /// index. Used by the WordFlow render loop to inject inline speaker-
     /// change markers between specific words.
@@ -1389,6 +1471,22 @@ private struct SegmentRow: View {
     }
 
     var body: some View {
+        if segment.isNonSpeech {
+            // Non-speech blocks have their own view — no speaker, no edit
+            // controls, no word interaction. They sit between speech rows
+            // and represent music/silence interludes.
+            MusicBlockRow(
+                segment: segment,
+                onDelete: { service.deleteSegment(segment, in: project) },
+                onSeek: { onSeek(segment.startSeconds) }
+            )
+        } else {
+            speakerSegmentBody
+        }
+    }
+
+    @ViewBuilder
+    private var speakerSegmentBody: some View {
         HStack(alignment: .top, spacing: 12) {
             VStack(alignment: .trailing, spacing: 2) {
                 Button {
@@ -1405,9 +1503,12 @@ private struct SegmentRow: View {
                 .popover(isPresented: $isEditingName, arrowEdge: .trailing) {
                     renamePopover
                 }
-                Text(TranscriptExporter.timestamp(segment.startSeconds))
-                    .font(.system(.caption2, design: .monospaced))
-                    .foregroundStyle(.tertiary)
+                HStack(spacing: 4) {
+                    Text(TranscriptExporter.timestamp(segment.startSeconds))
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    alignmentQualityDot
+                }
                 if segment.wasEdited {
                     Text("edited")
                         .font(.caption2)
@@ -1466,6 +1567,14 @@ private struct SegmentRow: View {
             onBeginEditing()
         } label: {
             Label("Edit Text…", systemImage: "pencil")
+        }
+        if segment.originalWords?.isEmpty == false {
+            Button {
+                service.restoreOriginalWordTimings(for: segment, in: project)
+            } label: {
+                Label("Restore Original Word Timings", systemImage: "arrow.counterclockwise.circle")
+            }
+            .help("Roll this segment's word timings back to the recognizer's original output. Useful when an alignment-verification pass produced worse results than the originals.")
         }
         Divider()
         mergeMenuContent
@@ -2196,6 +2305,118 @@ private struct SplitCandidateMarker: View {
                     .strokeBorder(.tint.opacity(0.4), lineWidth: 0.5)
             )
         }
+    }
+}
+
+/// Renders a non-speech ([MUSIC]) segment row. Replaces the entire
+/// `SegmentRow` body when `segment.isNonSpeech` is true — the user
+/// shouldn't be able to assign a speaker, edit text, or interact with
+/// "words" inside a music interlude. The row is non-interactive other
+/// than tap-to-seek and right-click → delete.
+///
+/// The visual is a row of music-note glyphs that drift upward and fade,
+/// driven by `TimelineView` so the animation runs without per-frame view
+/// rebuilds. Three notes spaced across the duration of the gap give the
+/// row enough motion to read as "something is happening" without being
+/// distracting on long transcripts.
+private struct MusicBlockRow: View {
+    let segment: SpeakerSegment
+    let onDelete: () -> Void
+    let onSeek: () -> Void
+
+    private var durationLabel: String {
+        let seconds = max(0, segment.endSeconds - segment.startSeconds)
+        let total = Int(seconds.rounded())
+        let m = total / 60
+        let s = total % 60
+        return m > 0 ? String(format: "%d:%02d", m, s) : String(format: "0:%02d", s)
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            // Same 90 px lead column as speech rows so block alignment
+            // reads like part of the same chronological list.
+            VStack(alignment: .trailing, spacing: 2) {
+                Text("Music")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                Text(TranscriptExporter.timestamp(segment.startSeconds))
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+            .frame(width: 90, alignment: .trailing)
+
+            HStack(spacing: 8) {
+                MusicNotesAnimation()
+                Text("[MUSIC]")
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .monospaced()
+                Text(durationLabel)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(.tint.opacity(0.06))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(.tint.opacity(0.18), style: StrokeStyle(lineWidth: 0.5, dash: [4, 3]))
+            )
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .onTapGesture { onSeek() }
+            .help("Non-speech interlude. Tap to seek to its start. Right-click to delete if it was detected by mistake.")
+            .contextMenu {
+                Button(role: .destructive, action: onDelete) {
+                    Label("Delete Music Block", systemImage: "trash")
+                }
+            }
+        }
+    }
+}
+
+/// Three music-note glyphs that drift upward and fade in a loop, driven
+/// by `TimelineView` so the animation doesn't force the parent view to
+/// re-render on every frame. Visual flair only — keeps the row feeling
+/// like an active musical break instead of dead space.
+private struct MusicNotesAnimation: View {
+    private let glyphs: [String] = ["music.note", "music.quarternote.3", "music.note"]
+    private let cycleSeconds: Double = 2.4
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
+            let t = context.date.timeIntervalSinceReferenceDate
+            HStack(spacing: 4) {
+                ForEach(0..<glyphs.count, id: \.self) { index in
+                    let phase = (t / cycleSeconds + Double(index) / Double(glyphs.count))
+                        .truncatingRemainder(dividingBy: 1)
+                    Image(systemName: glyphs[index])
+                        .font(.callout)
+                        .foregroundStyle(.tint)
+                        .opacity(noteOpacity(phase: phase))
+                        .offset(y: noteOffset(phase: phase))
+                }
+            }
+            .frame(width: 64, height: 22)
+        }
+    }
+
+    /// Triangular fade-in/out: opaque mid-cycle, transparent at ends.
+    /// Avoids notes "popping" in/out at the wrap-around.
+    private func noteOpacity(phase: Double) -> Double {
+        let centered = abs(phase - 0.5) * 2  // 0 at center, 1 at ends
+        return max(0, 1.0 - centered) * 0.85
+    }
+
+    /// Drifts upward across the cycle (phase 0 → low, phase 1 → high).
+    /// Combined with the opacity envelope, notes appear, rise, and fade.
+    private func noteOffset(phase: Double) -> CGFloat {
+        CGFloat(-(phase - 0.5) * 14)
     }
 }
 

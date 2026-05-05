@@ -145,6 +145,17 @@ final class SpeakerSegment {
     /// any inserted/changed words carry interpolated timings that the editor
     /// surfaces via a "Recompute Timings" affordance.
     var wasEdited: Bool = false
+    /// Marks this row as a non-speech (music / long silence) interlude
+    /// rather than a speaker turn. Inserted automatically by the music-
+    /// break detector and rendered as a non-editable block in the editor.
+    /// Lets the speech segments on either side anchor to actual speech
+    /// edges instead of bleeding word timings across the music gap, which
+    /// is the source of the "click first word after music, audio is out
+    /// of sync" symptom. Non-speech rows have empty `words` and `text`
+    /// set to a fixed marker (e.g. `"[MUSIC]"`), and skip every speaker-
+    /// centric feature (centroid recompute, relabel suggestions, splits,
+    /// merges, edits, find/replace).
+    var isNonSpeech: Bool = false
     /// Timestamp of the last successful forced-alignment pass that wrote
     /// this segment's word timings. `nil` for segments whose timings come
     /// straight out of the original transcription pipeline (never re-
@@ -152,6 +163,14 @@ final class SpeakerSegment {
     /// to schedule a background recompute, and by the optional idle-time
     /// healer to pick up the oldest-validated segments first.
     var lastTimingsRecomputeAt: Date?
+    /// One-time snapshot of the word timings as they came out of the
+    /// original transcription pipeline. Captured the *first* time a
+    /// recompute / verification pass is about to overwrite `words`, then
+    /// never updated again. Lets the user roll back to the recognizer's
+    /// original output if a verification pass produces worse results
+    /// (e.g. the audio slice is too short or noisy for the ASR to do
+    /// better). `nil` until the first recompute, and on legacy projects.
+    var originalWords: [WordTiming]?
     var project: TranscriptionProject?
 
     init(startSeconds: Double,
